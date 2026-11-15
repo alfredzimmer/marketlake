@@ -1,0 +1,9 @@
+{
+  "identities": [
+    {
+      "name": "marketlake",
+      "credentials": [{ "accessKey": "marketlake", "secretKey": "marketlake" }],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}

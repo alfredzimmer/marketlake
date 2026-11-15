@@ -33,11 +33,12 @@ services:
   # images were withdrawn; SeaweedFS speaks the same S3 API.)
   seaweedfs:
     image: chrislusf/seaweedfs:4.48
-    command: server -ip=seaweedfs -ip.bind=0.0.0.0 -dir=/data -s3 -s3.port=8333 -master.volumeSizeLimitMB=1024
+    command: server -ip=seaweedfs -ip.bind=0.0.0.0 -dir=/data -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json -master.volumeSizeLimitMB=1024
     ports:
       - "8333:8333"
     volumes:
       - seaweed-data:/data
+      - ./infra/seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:9333/cluster/status || exit 1"]
       interval: 5s
@@ -46,7 +47,7 @@ services:
   init-bucket:
     image: chrislusf/seaweedfs:4.48
     entrypoint: >
-      sh -c "sleep 3; echo 's3.bucket.create -name warehouse' | weed shell -master=seaweedfs:9333"
+      sh -c "sleep 3; echo 's3.bucket.create -name warehouse' | weed shell -master=seaweedfs:9333 || true"
     depends_on:
       seaweedfs:
         condition: service_healthy
@@ -54,6 +55,10 @@ services:
   iceberg-rest:
     image: apache/iceberg-rest-fixture:1.10.1
     environment:
+      # Default fixture catalog is in-memory SQLite; persist it so tables survive restarts.
+      CATALOG_URI: jdbc:sqlite:file:/catalog/iceberg.db
+      CATALOG_JDBC_USER: user
+      CATALOG_JDBC_PASSWORD: password
       CATALOG_WAREHOUSE: s3://warehouse/
       CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
       CATALOG_S3_ENDPOINT: http://seaweedfs:8333
@@ -63,6 +68,9 @@ services:
       AWS_REGION: us-east-1
     ports:
       - "8181:8181"
+    user: root
+    volumes:
+      - catalog-data:/catalog
     depends_on:
       init-bucket:
         condition: service_completed_successfully
@@ -78,3 +86,4 @@ services:
 
 volumes:
   seaweed-data:
+  catalog-data:
