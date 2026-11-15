@@ -52,13 +52,25 @@ services:
       seaweedfs:
         condition: service_healthy
 
-  iceberg-rest:
-    image: apache/iceberg-rest-fixture:1.10.1
+  catalog-db:
+    image: postgres:17.6-alpine
     environment:
-      # Default fixture catalog is in-memory SQLite; persist it so tables survive restarts.
-      CATALOG_URI: jdbc:sqlite:file:/catalog/iceberg.db
-      CATALOG_JDBC_USER: user
-      CATALOG_JDBC_PASSWORD: password
+      POSTGRES_USER: iceberg
+      POSTGRES_PASSWORD: iceberg
+      POSTGRES_DB: iceberg_catalog
+    volumes:
+      - catalog-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iceberg -d iceberg_catalog"]
+      interval: 3s
+      retries: 20
+
+  iceberg-rest:
+    build: infra/iceberg-rest
+    environment:
+      CATALOG_URI: jdbc:postgresql://catalog-db:5432/iceberg_catalog
+      CATALOG_JDBC_USER: iceberg
+      CATALOG_JDBC_PASSWORD: iceberg
       CATALOG_WAREHOUSE: s3://warehouse/
       CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
       CATALOG_S3_ENDPOINT: http://seaweedfs:8333
@@ -68,10 +80,9 @@ services:
       AWS_REGION: us-east-1
     ports:
       - "8181:8181"
-    user: root
-    volumes:
-      - catalog-data:/catalog
     depends_on:
+      catalog-db:
+        condition: service_healthy
       init-bucket:
         condition: service_completed_successfully
 
