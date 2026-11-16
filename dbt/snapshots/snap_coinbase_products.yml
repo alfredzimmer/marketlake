@@ -1,0 +1,22 @@
+snapshots:
+  - name: snap_coinbase_products
+    description: >
+      SCD2 history of Coinbase product attributes. A new version is opened when
+      any tracked column changes; products dropped from the API are closed out.
+    relation: source('ref', 'coinbase_products')
+    config:
+      schema: snapshots
+      file_format: iceberg
+      unique_key: id
+      strategy: check
+      check_cols:
+        - status
+        - trading_disabled
+        - quote_increment
+        - base_increment
+        - min_market_funds
+        - post_only
+        - limit_only
+        - cancel_only
+        - auction_mode
+      hard_deletes: invalidate

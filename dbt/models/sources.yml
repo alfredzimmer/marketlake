@@ -1,0 +1,31 @@
+version: 2
+
+sources:
+  - name: silver
+    description: Deduplicated, typed trades written by the Spark streaming job.
+    tables:
+      - name: trades
+        loaded_at_field: ingest_ts
+        freshness:
+          warn_after: {count: 10, period: minute}
+          error_after: {count: 60, period: minute}
+        data_tests:
+          - unique_combination:
+              columns: [exchange, symbol, trade_id]
+
+  - name: gold
+    description: Streaming outputs.
+    tables:
+      - name: bars_1m
+        description: 1-minute bars emitted by the stream after the watermark closes each window.
+        data_tests:
+          - unique_combination:
+              columns: [exchange, symbol, window_start]
+
+  - name: ref
+    tables:
+      - name: coinbase_products
+        description: Current Coinbase product list (full refresh by marketlake.ref.coinbase_products).
+        columns:
+          - name: id
+            data_tests: [not_null, unique]

@@ -1,0 +1,42 @@
+version: 2
+
+models:
+  - name: fct_bars_1d
+    description: Daily OHLCV/VWAP per symbol from silver; trailing days are recomputed for late data.
+    data_tests:
+      - unique_combination:
+          columns: [exchange, symbol, trade_date]
+    columns:
+      - name: exchange
+        data_tests: [not_null]
+      - name: symbol
+        data_tests: [not_null]
+      - name: trade_date
+        data_tests: [not_null]
+      - name: trade_count
+        data_tests: [not_null]
+      - name: missing_trade_ids
+        description: Trade ids within the day's id span that were never ingested.
+
+  - name: dim_symbol
+    description: SCD2 symbol dimension (one row per version).
+    data_tests:
+      - unique_combination:
+          columns: [symbol, valid_from]
+    columns:
+      - name: symbol
+        data_tests: [not_null]
+      - name: status
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [online, offline, internal, delisted]
+
+  - name: rpt_bar_reconciliation
+    description: Streaming gold bars vs batch recompute from silver, per closed minute.
+    columns:
+      - name: status
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [match, missing_in_stream, missing_in_batch, count_mismatch, value_mismatch]

@@ -1,0 +1,27 @@
+name: marketlake
+version: "0.1.0"
+config-version: 2
+profile: marketlake
+
+model-paths: ["models"]
+snapshot-paths: ["snapshots"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+target-path: target
+clean-targets: ["target"]
+
+vars:
+  # Daily bars are recomputed for this many trailing days on each incremental
+  # run, so trades that land late (backfill, spill replay) are included.
+  late_data_lookback_days: 2
+  # Minute bars newer than this are still open in the stream; don't reconcile them.
+  reconcile_settle_minutes: 5
+
+models:
+  marketlake:
+    +file_format: iceberg
+    staging:
+      +materialized: ephemeral
+    marts:
+      +schema: marts
+      +materialized: table

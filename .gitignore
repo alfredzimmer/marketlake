@@ -2,3 +2,10 @@
 __pycache__/
 data/
 *.pyc
+dbt/target/
+dbt/logs/
+dbt/.profiles/
+logs/
+metastore_db/
+derby.log
+spark-warehouse/
