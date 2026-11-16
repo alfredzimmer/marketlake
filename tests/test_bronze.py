@@ -24,6 +24,7 @@ def good(trade_id, **overrides):
 
 
 @pytest.mark.parametrize("value, error", [
+    (None, "tombstone"),
     (b"not-json{", "invalid json"),
     (b"\xff\xfe", "invalid json"),
     (b"[1, 2]", "expected object"),
@@ -46,17 +47,21 @@ def test_poison_pill_is_quarantined_not_fatal(tmp_path):
     sink.add(0, 0, good(1), TS_MS)
     sink.add(0, 1, b"not-json{", TS_MS)
     sink.add(0, 2, good(2, exchange="../../escape"), TS_MS)
-    sink.add(0, 3, good(3), TS_MS)
+    sink.add(0, 3, None, TS_MS)  # tombstone
+    sink.add(0, 4, b"\xff\xfe binary", TS_MS)
+    sink.add(0, 5, good(3), TS_MS)
     sink.flush()
 
-    assert consumer.commits == [{0: 4}]  # offsets advance past the bad records
-    assert sink.unparsed == 2
+    assert consumer.commits == [{0: 6}]  # offsets advance past the bad records
+    assert sink.unparsed == 4
     assert not (tmp_path.parent / "escape").exists()
 
     t = ds.dataset(tmp_path / "trades", format="parquet", partitioning="hive").to_table()
     rows = sorted(t.to_pylist(), key=lambda r: r["_kafka_offset"])
-    assert [r["exchange"] for r in rows] == ["coinbase", "_unparsed", "_unparsed", "coinbase"]
-    assert rows[1]["_raw_value"] == "not-json{"
+    assert [r["exchange"] for r in rows] == ["coinbase"] + ["_unparsed"] * 4 + ["coinbase"]
+    assert rows[1]["_raw_value"] == b"not-json{"
+    assert rows[3]["_raw_value"] is None and "tombstone" in rows[3]["_parse_error"]
+    assert rows[4]["_raw_value"] == b"\xff\xfe binary"  # bytes preserved exactly
     assert "invalid json" in rows[1]["_parse_error"]
     assert rows[1]["date"] == "2026-11-15"
     assert rows[0]["_raw_value"] is None and rows[0]["trade_id"] == 1

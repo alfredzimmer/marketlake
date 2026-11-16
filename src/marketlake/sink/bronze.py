@@ -45,7 +45,7 @@ SCHEMA = pa.schema([
     ("ingest_ts", pa.string()),
     ("_kafka_partition", pa.int32()),
     ("_kafka_offset", pa.int64()),
-    ("_raw_value", pa.string()),  # only set for unparsed records
+    ("_raw_value", pa.binary()),  # exact bytes; only set for unparsed records
     ("_parse_error", pa.string()),
 ])
 
@@ -56,9 +56,11 @@ SAFE_SEGMENT = re.compile(r"[a-z0-9][a-z0-9_.-]*")
 DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
-def parse_record(value: bytes) -> dict:
+def parse_record(value: bytes | None) -> dict:
     """Parses and validates one trades.raw value. Raises ValueError on anything
     that would fail the Parquet write or produce an unsafe partition path."""
+    if value is None:
+        raise ValueError("null value (tombstone)")
     try:
         d = json.loads(value)
     except (UnicodeDecodeError, json.JSONDecodeError) as e:
@@ -101,7 +103,7 @@ class BronzeSink:
     def stop(self, *_) -> None:
         self._running = False
 
-    def add(self, partition: int, offset: int, value: bytes, kafka_ts_ms: int) -> None:
+    def add(self, partition: int, offset: int, value: bytes | None, kafka_ts_ms: int) -> None:
         meta = {"_kafka_partition": partition, "_kafka_offset": offset,
                 "_raw_value": None, "_parse_error": None}
         try:
@@ -111,7 +113,7 @@ class BronzeSink:
             self.unparsed += 1
             log.warning("unparsed record at p%d@%d: %s", partition, offset, e)
             row = dict.fromkeys(SCHEMA.names) | meta
-            row["_raw_value"] = value.decode("utf-8", errors="replace")
+            row["_raw_value"] = value
             row["_parse_error"] = str(e)
             date = datetime.fromtimestamp(kafka_ts_ms / 1000, UTC).date().isoformat()
             key = (partition, UNPARSED, date)
