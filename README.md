@@ -45,6 +45,7 @@ uv run pytest
 - **Prices as decimal strings.** No float round-trips at ingest; typing happens in silver.
 - **Taker side, not maker side.** Coinbase reports the maker side. We store the aggressor side, the convention for order-flow metrics.
 - **Gap detection on `trade_id`.** Coinbase trade ids are contiguous per product. The detector's state survives reconnects, so a disconnect window shows up as a gap event on `ingest.gaps`, which the phase 4 backfiller consumes.
+- **Bronze never rejects a record.** Anything that fails parsing or validation (including partition-path values like `exchange="../.."`) is written to `exchange=_unparsed/` with its raw value and parse error. A poison pill can't stall the sink, and nothing is lost.
 - **Bronze sink is at-least-once by design.** Files are fsynced and atomically renamed *before* offsets are committed. File names encode the Kafka partition and offset range (`p1-733-1255.parquet`), so a replay is auditable. Deduplication on `(exchange, symbol, trade_id)` happens in silver.
 
 ### Phase 2: stream processing
@@ -73,7 +74,7 @@ Problems that came up while running the pipeline live:
 | Replay a committed **silver** batch (delete checkpoint commit) | ❌ +328 duplicate rows: MERGE bounds shifted by local TZ | [#1](../../issues/1) |
 | Replay a committed **gold** epoch that emitted bars | ✅ skipped via Iceberg `epochId` in snapshot summary; 0 duplicate bars | |
 | `kill -9` stream job ×3 during live ingest, then drain | ✅ silver: 0 missing of 17,886 trades; gold: 33/33 bars match batch recompute (OHLC, VWAP, volume, count) | |
-| Malformed JSON / non-numeric price into `trades.raw` | ✅ stream skips them ❌ bronze sink crash-loops; ⚠️ stream drops are uncounted | [#3](../../issues/3), [#7](../../issues/7) |
+| Malformed JSON / non-numeric price into `trades.raw` | ✅ stream skips them; ❌ → ✅ bronze sink crash-looped, now quarantines to `exchange=_unparsed` with raw value + error; ⚠️ stream drops are uncounted | [#3](../../issues/3), [#7](../../issues/7) |
 | Trade 2h older than watermark | ✅ kept in silver, excluded from gold, `late_dropped=1` | |
 | Kafka down 20s (8s delivery timeout) | ❌ 804/1,678 trades silently lost, 0 gaps flagged | [#2](../../issues/2) |
 | Websocket handshake rejected | ❌ ingestor exits (`InvalidStatus`) | [#4](../../issues/4) |
