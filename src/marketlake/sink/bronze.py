@@ -8,24 +8,29 @@ range it covers, so replays are auditable.
 
 Layout: data/bronze/trades/exchange=<ex>/date=<YYYY-MM-DD>/p<part>-<first>-<last>.parquet
 
+Records that don't parse or validate are not dropped and don't stop the sink:
+they land in exchange=_unparsed/date=<kafka timestamp date> with the raw value
+and the error, so bronze stays lossless and a poison pill can't crash-loop it.
+
 Run: uv run python -m marketlake.sink.bronze
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
+import re
 import signal
 import time
 from collections import defaultdict
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 from confluent_kafka import Consumer, KafkaError, TopicPartition
-
-from marketlake.models import Trade
 
 TOPIC = "trades.raw"
 
@@ -40,7 +45,43 @@ SCHEMA = pa.schema([
     ("ingest_ts", pa.string()),
     ("_kafka_partition", pa.int32()),
     ("_kafka_offset", pa.int64()),
+    ("_raw_value", pa.binary()),  # exact bytes; only set for unparsed records
+    ("_parse_error", pa.string()),
 ])
+
+UNPARSED = "_unparsed"
+STRING_FIELDS = ("exchange", "symbol", "price", "size", "taker_side", "event_ts", "ingest_ts")
+# Values used as path segments; anything else could escape the bronze root.
+SAFE_SEGMENT = re.compile(r"[a-z0-9][a-z0-9_.-]*")
+DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def parse_record(value: bytes | None) -> dict:
+    """Parses and validates one trades.raw value. Raises ValueError on anything
+    that would fail the Parquet write or produce an unsafe partition path."""
+    if value is None:
+        raise ValueError("null value (tombstone)")
+    try:
+        d = json.loads(value)
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise ValueError(f"invalid json: {e}") from None
+    if not isinstance(d, dict):
+        raise ValueError(f"expected object, got {type(d).__name__}")
+    missing = [f for f in (*STRING_FIELDS, "trade_id") if f not in d]
+    if missing:
+        raise ValueError(f"missing fields: {missing}")
+    for f in STRING_FIELDS:
+        if not isinstance(d[f], str):
+            raise ValueError(f"{f} must be a string")
+    if not isinstance(d["trade_id"], int) or isinstance(d["trade_id"], bool):
+        raise ValueError("trade_id must be an integer")
+    if not -(2**63) <= d["trade_id"] < 2**63:
+        raise ValueError("trade_id out of int64 range")
+    if not SAFE_SEGMENT.fullmatch(d["exchange"]):
+        raise ValueError(f"unsafe exchange name: {d['exchange']!r}")
+    if not DATE.match(d["event_ts"]):
+        raise ValueError(f"event_ts not ISO-8601: {d['event_ts']!r}")
+    return {f: d[f] for f in (*STRING_FIELDS, "trade_id")}
 
 log = logging.getLogger("sink.bronze")
 
@@ -57,19 +98,26 @@ class BronzeSink:
         self._rows = 0
         self._oldest: float | None = None
         self._running = True
+        self.unparsed = 0
 
     def stop(self, *_) -> None:
         self._running = False
 
-    def add(self, partition: int, offset: int, value: bytes) -> None:
-        t = Trade.from_json(value)
-        row = {
-            "exchange": t.exchange, "symbol": t.symbol, "trade_id": t.trade_id,
-            "price": t.price, "size": t.size, "taker_side": t.taker_side,
-            "event_ts": t.event_ts, "ingest_ts": t.ingest_ts,
-            "_kafka_partition": partition, "_kafka_offset": offset,
-        }
-        self._buf[(partition, t.exchange, t.event_ts[:10])].append(row)
+    def add(self, partition: int, offset: int, value: bytes | None, kafka_ts_ms: int) -> None:
+        meta = {"_kafka_partition": partition, "_kafka_offset": offset,
+                "_raw_value": None, "_parse_error": None}
+        try:
+            row = parse_record(value) | meta
+            key = (partition, row["exchange"], row["event_ts"][:10])
+        except ValueError as e:
+            self.unparsed += 1
+            log.warning("unparsed record at p%d@%d: %s", partition, offset, e)
+            row = dict.fromkeys(SCHEMA.names) | meta
+            row["_raw_value"] = value
+            row["_parse_error"] = str(e)
+            date = datetime.fromtimestamp(kafka_ts_ms / 1000, UTC).date().isoformat()
+            key = (partition, UNPARSED, date)
+        self._buf[key].append(row)
         self._next_offsets[partition] = offset + 1
         self._rows += 1
         if self._oldest is None:
@@ -121,7 +169,7 @@ class BronzeSink:
                         if msg.error().code() != KafkaError._PARTITION_EOF:
                             log.error("consumer error: %s", msg.error())
                     else:
-                        self.add(msg.partition(), msg.offset(), msg.value())
+                        self.add(msg.partition(), msg.offset(), msg.value(), msg.timestamp()[1])
                 if self.should_flush():
                     self.flush()
             self.flush()
