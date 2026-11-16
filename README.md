@@ -108,6 +108,8 @@ Data quality tests:
 | `compact_and_expire` | hourly | `maintenance` compact + expire on every table |
 | `remove_orphans` | daily 03:30 | orphan-file cleanup |
 
+`dagster dev` parses the dbt project on startup. Outside it (e.g. `dagster job execute`, a deployment), run `uv run python -m marketlake.transform parse` first so `dbt/target/manifest.json` exists.
+
 ## Findings
 
 Problems that came up while running the pipeline live:
