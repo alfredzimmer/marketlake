@@ -142,30 +142,36 @@ class CoinbaseIngestor:
         if not records:
             return True
         log.info("replaying %d spilled records", len(records))
-        failed = 0
+        acked = failed = 0
 
         def on_delivery(err, msg) -> None:
-            nonlocal failed
+            nonlocal acked, failed
             if err is None:
+                acked += 1
                 self._last_ok = time.monotonic()
             else:
                 failed += 1
                 self._last_fail = time.monotonic()
 
-        for i, (topic, key, value) in enumerate(records):
+        sent = 0
+        for topic, key, value in records:
             try:
                 self.producer.produce(topic, key=key, value=value, on_delivery=on_delivery)
             except BufferError:
-                self.producer.flush(flush_timeout)  # make room, then retry once
+                self.producer.poll(1.0)  # let the queue drain a little, then retry once
                 try:
                     self.producer.produce(topic, key=key, value=value, on_delivery=on_delivery)
                 except BufferError:
-                    failed += len(records) - i
                     break
-        undelivered = self.producer.flush(flush_timeout)
-        if failed or undelivered:
-            log.warning("replay incomplete (%d failed, %d pending); will retry",
-                        failed, undelivered)
+            sent += 1
+        # Wait for *these* records' acks, not producer.flush(): flush also waits
+        # on live traffic, which never fully drains while trades keep arriving.
+        deadline = time.monotonic() + flush_timeout
+        while acked + failed < sent and time.monotonic() < deadline:
+            self.producer.poll(0.1)
+        if acked < len(records):
+            log.warning("replay incomplete (%d/%d acked, %d failed); will retry",
+                        acked, len(records), failed)
             return False
         self.spill.done()
         self.stats.replayed += len(records)

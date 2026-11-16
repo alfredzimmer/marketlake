@@ -117,7 +117,8 @@ def test_server_side_close_backs_off_instead_of_hot_looping():
         async with serve(handler, "127.0.0.1", 0) as server:
             port = server.sockets[0].getsockname()[1]
             ing = CoinbaseIngestor(["BTC-USD"], FakeProducer(), ws_url=f"ws://127.0.0.1:{port}",
-                                   initial_backoff=0.1, max_backoff=0.4)
+                                   initial_backoff=0.1, max_backoff=0.4,
+                                   spill_path=Path(tempfile.mkdtemp()) / "spill.jsonl")
             task = asyncio.create_task(ing.run())
             await asyncio.sleep(1.0)
             ing.stop()

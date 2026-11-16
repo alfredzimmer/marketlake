@@ -129,3 +129,19 @@ def test_leftover_replay_batch_survives_crash(tmp_path):
 
     records = SpillLog(tmp_path / "spill.jsonl").take()
     assert [r[2] for r in records] == [b'{"trade_id": 1}', b'{"trade_id": 2}']
+
+
+def test_replay_completes_under_continuous_live_traffic(tmp_path):
+    class BusyProducer(FlakyProducer):
+        def flush(self, timeout=0):
+            self.poll()
+            return 1  # live trades keep arriving, so the queue is never empty
+
+    p = BusyProducer()
+    ing = make(tmp_path, p)
+    p.down = True
+    ing.handle(match(1))
+    p.down = False
+    assert ing.replay_spill(flush_timeout=0.5) is True
+    assert not ing.spill.pending()
+    assert delivered_ids(p) == [1]
