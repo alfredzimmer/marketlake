@@ -16,28 +16,32 @@ PACKAGES = [
 ]
 
 
+def spark_conf() -> dict[str, str]:
+    """Spark settings for the `lake` catalog. Single source of truth: used by
+    `build()` and rendered into the dbt profile (`marketlake.transform`)."""
+    return {
+        "spark.master": os.environ.get("SPARK_MASTER", "local[4]"),
+        "spark.jars.packages": ",".join(PACKAGES),
+        "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
+        "spark.sql.catalog.lake": "org.apache.iceberg.spark.SparkCatalog",
+        "spark.sql.catalog.lake.type": "rest",
+        "spark.sql.catalog.lake.uri": os.environ.get("ICEBERG_REST_URI", "http://localhost:8181"),
+        "spark.sql.catalog.lake.io-impl": "org.apache.iceberg.aws.s3.S3FileIO",
+        "spark.sql.catalog.lake.s3.endpoint": os.environ.get("S3_ENDPOINT", "http://localhost:8333"),
+        "spark.sql.catalog.lake.s3.path-style-access": "true",
+        "spark.sql.catalog.lake.s3.access-key-id": "marketlake",
+        "spark.sql.catalog.lake.s3.secret-access-key": "marketlake",
+        "spark.sql.catalog.lake.client.region": "us-east-1",
+        "spark.sql.defaultCatalog": "lake",
+        "spark.sql.session.timeZone": "UTC",
+        "spark.sql.shuffle.partitions": "8",
+    }
+
+
 def build(app: str) -> SparkSession:
-    catalog_uri = os.environ.get("ICEBERG_REST_URI", "http://localhost:8181")
-    s3_endpoint = os.environ.get("S3_ENDPOINT", "http://localhost:8333")
-    spark = (
-        SparkSession.builder.appName(app)
-        .master(os.environ.get("SPARK_MASTER", "local[4]"))
-        .config("spark.jars.packages", ",".join(PACKAGES))
-        .config("spark.sql.extensions",
-                "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
-        .config("spark.sql.catalog.lake", "org.apache.iceberg.spark.SparkCatalog")
-        .config("spark.sql.catalog.lake.type", "rest")
-        .config("spark.sql.catalog.lake.uri", catalog_uri)
-        .config("spark.sql.catalog.lake.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
-        .config("spark.sql.catalog.lake.s3.endpoint", s3_endpoint)
-        .config("spark.sql.catalog.lake.s3.path-style-access", "true")
-        .config("spark.sql.catalog.lake.s3.access-key-id", "marketlake")
-        .config("spark.sql.catalog.lake.s3.secret-access-key", "marketlake")
-        .config("spark.sql.catalog.lake.client.region", "us-east-1")
-        .config("spark.sql.defaultCatalog", "lake")
-        .config("spark.sql.session.timeZone", "UTC")
-        .config("spark.sql.shuffle.partitions", "8")
-        .getOrCreate()
-    )
+    builder = SparkSession.builder.appName(app)
+    for key, value in spark_conf().items():
+        builder = builder.config(key, value)
+    spark = builder.getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
     return spark

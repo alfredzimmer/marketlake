@@ -13,7 +13,10 @@ Coinbase / Hyperliquid / Binance websockets
         silver.trades  deduped, typed, idempotent MERGE
         gold.bars_1m   1m OHLCV + VWAP, event-time watermark
    → Iceberg (REST catalog on Postgres) over S3 (SeaweedFS) [phase 2 ✅]
-   → dbt models + data quality checks, Dagster/Airflow      [phase 3]
+   → dbt on Spark/Iceberg                                   [phase 3 ✅]
+        fct_bars_1d, dim_symbol (SCD2), rpt_bar_reconciliation
+        data quality tests (OHLC, outliers, gaps, reconciliation)
+   → Dagster orchestration                                  [phase 3]
    → exactly-once proof, REST backfill, compaction,
      batch-vs-stream reconciliation                         [phase 4]
 ```
@@ -28,6 +31,8 @@ uv sync
 uv run python -m marketlake.ingest.coinbase       # websocket → trades.raw
 uv run python -m marketlake.sink.bronze           # trades.raw → data/bronze/ (Parquet)
 uv run python -m marketlake.spark.stream_trades   # trades.raw → silver.trades, gold.bars_1m
+uv run python -m marketlake.ref.coinbase_products # product metadata → ref.coinbase_products
+uv run python -m marketlake.transform build       # dbt: snapshot, models, tests
 uv run pytest
 ```
 
@@ -67,6 +72,29 @@ uv run pytest
 - **expire:** snapshots older than 24h, but **always keeps the last 100**. The Iceberg streaming sink makes gold replays idempotent by finding its last epoch id in snapshot history. If compaction commits after the stream and expiry keeps only that snapshot, the marker is gone and a replayed epoch is appended twice. A test reproduces this.
 - **orphans:** files older than 3 days that no snapshot references (younger files may belong to an in-flight commit). Uses `prefix_listing` so it lists through Iceberg's S3FileIO; the default Hadoop listing has no `s3://` filesystem.
 
+### Phase 3: dbt
+
+dbt-spark's in-process `session` method runs on the same Spark/Iceberg setup. `marketlake.transform` renders `profiles.yml` from `spark_conf()`, so dbt and the Spark jobs can't drift apart on catalog or S3 settings.
+
+| model | what |
+|---|---|
+| `fct_bars_1d` | Daily OHLCV/VWAP per symbol. Incremental MERGE that **recomputes the trailing 2 days** on every run, so late trades (spill replay, backfill) land in the right day. `missing_trade_ids` counts holes in the contiguous trade-id span. |
+| `dim_symbol` | **SCD2** product dimension from a dbt snapshot of `ref.coinbase_products` (check strategy on status, tick/lot size, trading flags; products that vanish from the API are closed out). |
+| `rpt_bar_reconciliation` | Streaming `gold.bars_1m` vs a batch recompute from silver for every settled minute: `match` / `count_mismatch` (late trades) / `value_mismatch` / `missing_in_stream` / `missing_in_batch`. Phase 4's stream-vs-batch reconciliation, run continuously. |
+
+Data quality tests:
+- unique keys on every table
+- OHLC consistency (`low ≤ open/close ≤ high`, VWAP in range)
+- **price outliers** (>20% from the daily VWAP)
+- one current version per symbol
+- trade-id gaps (warn)
+- stream/batch value mismatches (error)
+- bars missing from the stream (warn)
+- late trades over 1% (error)
+- source freshness
+
+`tests/test_dbt.py` runs real `dbt build`/`snapshot`/`test` against the pytest Spark session in CI. It covers correct bars, SCD2 versioning across a status/tick change and a delisting, late trades picked up by the incremental lookback, and an outlier failing the build.
+
 ## Findings
 
 Problems that came up while running the pipeline live:
@@ -75,12 +103,15 @@ Problems that came up while running the pipeline live:
 2. **Overlapping ingestors duplicate data, and the pipeline absorbs it.** Two ingestor processes ran at once for about 75s by accident. Kafka ended up with 10,376 records but only 9,037 distinct trades. Silver held exactly 9,037 rows with 0 missing, and all 21 gold bars matched a batch recompute from silver (count, volume, close), including the overlap windows.
 3. **Small files came from the write path, not just batch size.** Every silver commit wrote exactly 8 files, even for 16 rows. Spark disables AQE for streaming micro-batches, so the MERGE's sort-order range shuffle wrote one file per shuffle partition (8). At a 10s trigger that's ~69k files/day. Re-enabling AQE for the MERGE (a normal batch query inside `foreachBatch`) plus `write.spark.advisory-partition-size-bytes` brought it to **1 file per commit** live. Compaction (`maintenance compact`) handles the rest: 177 → 18 files, 21 → 1 manifests, run while the stream was writing. Query time on the same data: 159 ms at 41 files vs 362 ms at 194 files.
 4. **Gap state doesn't survive process restarts.** The gap detector catches holes across websocket reconnects, but a fresh process starts with empty state, so downtime between runs goes undetected. Phase 4: seed it from `max(trade_id)` per symbol in silver at startup ([#8](../../issues/8)).
+5. **Well-formed garbage passes every structural check.** A trade priced at 1.00 (BTC ~65,000) is valid JSON, has every field, and is internally consistent as a bar (`low ≤ close ≤ high`). It reached silver and set BTC's daily low and close. Only a semantic check (price vs daily VWAP) caught it, so that test now exists.
+6. **Rolling back a checkpoint's offsets silently drops gold bars.** The Iceberg streaming sink skips any epoch ≤ the last one it committed for that query id. After a forced replay re-planned later epochs under reused ids, bars were skipped without any error. The reconciliation report surfaced 8 missing minutes. A fresh checkpoint (new query id) is safe; editing one in place is not.
 
 ## Fault-injection testing (2026-11-15)
 
 | test | result | issue |
 |---|---|---|
 | Clean clone → `uv sync` → `pytest` | ✅ 8/8 pass | |
+| Snapshot (SCD2) on the second run | ❌ → ✅ dbt-spark's Iceberg path created its staging view by bare name in the default catalog (`lake`) → `VIEW_NOT_FOUND`; fixed with a temporary-view macro override | |
 | Replay a committed **silver** batch (delete checkpoint commit) | ❌ → ✅ +328 duplicate rows from MERGE bounds shifted by local TZ; after fix a 2,549-row replay adds 0 | [#1](../../issues/1) |
 | Replay a committed **gold** epoch that emitted bars | ✅ skipped via Iceberg `epochId` in snapshot summary; 0 duplicate bars | |
 | `kill -9` stream job ×3 during live ingest, then drain | ✅ silver: 0 missing of 17,886 trades; gold: 33/33 bars match batch recompute (OHLC, VWAP, volume, count) | |
