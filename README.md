@@ -56,7 +56,8 @@ uv run pytest
 - **Dedupe in both layers.** Silver dedupes on the MERGE key. Gold uses `dropDuplicatesWithinWatermark`, which keeps dedupe state bounded by the watermark instead of growing forever. The same `bars_1m()` function runs on batch DataFrames (falling back to a full `dropDuplicates`), so stream and batch share one definition of a bar.
 - **Open/close by `trade_id`, not arrival order.** `min_by(price, trade_id)` / `max_by(price, trade_id)` stay correct when events arrive out of order inside a window.
 - **Decimal precision is deliberate.** `decimal(28,10) * decimal(28,10)` overflows 38 digits, and Spark silently cuts the result scale to 6. The notional is computed from `decimal(20,10)` operands, which gives a `decimal(38,17)` product.
-- **`try_cast` on parse.** Spark 4 defaults to ANSI mode, where one malformed price throws and fails the query. Bad records become nulls, are filtered out of the typed layers, and remain in bronze. A unit test caught this.
+- **`try_cast` on parse.** Spark 4 defaults to ANSI mode, where one malformed price throws and fails the query. A unit test caught this.
+- **Rejects are quarantined, not dropped.** Each record is tagged with a `reject_reason` covering every NOT NULL silver column. A single null in a required Iceberg column fails the whole write, so a partial check is a crash waiting to happen. Rejects go to `quarantine.trades` with their raw bytes, merged on Kafka partition/offset so replays don't duplicate them, and counts are logged per batch.
 
 ## Findings
 
@@ -75,7 +76,8 @@ Problems that came up while running the pipeline live:
 | Replay a committed **silver** batch (delete checkpoint commit) | ❌ → ✅ +328 duplicate rows from MERGE bounds shifted by local TZ; after fix a 2,549-row replay adds 0 | [#1](../../issues/1) |
 | Replay a committed **gold** epoch that emitted bars | ✅ skipped via Iceberg `epochId` in snapshot summary; 0 duplicate bars | |
 | `kill -9` stream job ×3 during live ingest, then drain | ✅ silver: 0 missing of 17,886 trades; gold: 33/33 bars match batch recompute (OHLC, VWAP, volume, count) | |
-| Malformed JSON / non-numeric price into `trades.raw` | ✅ stream skips them; ❌ → ✅ bronze sink crash-looped, now quarantines to `exchange=_unparsed` with raw value + error; ⚠️ stream drops are uncounted | [#3](../../issues/3), [#7](../../issues/7) |
+| Malformed JSON / non-numeric price into `trades.raw` | ✅ stream skips them; ❌ → ✅ bronze sink crash-looped, now quarantines to `exchange=_unparsed` with raw value + error; ⚠️ → ✅ stream drops were uncounted, now go to `quarantine.trades` | [#3](../../issues/3), [#7](../../issues/7) |
+| Valid JSON missing `exchange` | ❌ → ✅ failed every silver write (`NOT_NULL_ASSERT_VIOLATION`) and would fail again after each restart; now quarantined | [#7](../../issues/7) |
 | Trade 2h older than watermark | ✅ kept in silver, excluded from gold, `late_dropped=1` | |
 | Kafka down 20s (8s delivery timeout) | ❌ → ✅ 804/1,678 trades silently lost; now spilled to a local journal and replayed: 848 spilled, 848 replayed, 3,001/3,001 in Kafka, 0 duplicates | [#2](../../issues/2) |
 | Websocket handshake rejected | ❌ → ✅ ingestor exited (`InvalidStatus`); now backs off (honoring `Retry-After`) and skips malformed messages, which surface as gaps | [#4](../../issues/4) |

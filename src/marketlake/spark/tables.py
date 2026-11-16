@@ -13,6 +13,7 @@ from pyspark.sql import SparkSession
 DDL = [
     "CREATE NAMESPACE IF NOT EXISTS silver",
     "CREATE NAMESPACE IF NOT EXISTS gold",
+    "CREATE NAMESPACE IF NOT EXISTS quarantine",
     """
     CREATE TABLE IF NOT EXISTS silver.trades (
         exchange        STRING    NOT NULL,
@@ -55,6 +56,21 @@ DDL = [
     )
     USING iceberg
     PARTITIONED BY (days(window_start))
+    TBLPROPERTIES ('format-version' = '2')
+    """,
+    # Records from trades.raw that failed parsing/validation, keyed by their
+    # Kafka coordinates so replayed batches don't duplicate them.
+    """
+    CREATE TABLE IF NOT EXISTS quarantine.trades (
+        kafka_partition INT       NOT NULL,
+        kafka_offset    BIGINT    NOT NULL,
+        kafka_ts        TIMESTAMP,
+        raw_value       BINARY,
+        reject_reason   STRING    NOT NULL,
+        quarantined_at  TIMESTAMP NOT NULL
+    )
+    USING iceberg
+    PARTITIONED BY (days(kafka_ts))
     TBLPROPERTIES ('format-version' = '2')
     """,
 ]

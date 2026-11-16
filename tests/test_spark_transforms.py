@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from marketlake.spark.stream_trades import bars_1m, parse_trades
@@ -6,8 +7,10 @@ from marketlake.spark.stream_trades import bars_1m, parse_trades
 
 def kafka_rows(spark, trades, extra_values=()):
     values = [json.dumps(t).encode() for t in trades] + list(extra_values)
+    kafka_ts = datetime(2026, 11, 15, 22, 0, tzinfo=UTC)
     return spark.createDataFrame(
-        [(v, 0, i) for i, v in enumerate(values)], "value binary, partition int, offset long"
+        [(v, 0, i, kafka_ts) for i, v in enumerate(values)],
+        "value binary, partition int, offset long, timestamp timestamp",
     )
 
 
