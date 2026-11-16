@@ -16,7 +16,7 @@ Coinbase / Hyperliquid / Binance websockets
    → dbt on Spark/Iceberg                                   [phase 3 ✅]
         fct_bars_1d, dim_symbol (SCD2), rpt_bar_reconciliation
         data quality tests (OHLC, outliers, gaps, reconciliation)
-   → Dagster orchestration                                  [phase 3]
+   → Dagster orchestration                                  [phase 3 ✅]
    → exactly-once proof, REST backfill, compaction,
      batch-vs-stream reconciliation                         [phase 4]
 ```
@@ -33,6 +33,7 @@ uv run python -m marketlake.sink.bronze           # trades.raw → data/bronze/ 
 uv run python -m marketlake.spark.stream_trades   # trades.raw → silver.trades, gold.bars_1m
 uv run python -m marketlake.ref.coinbase_products # product metadata → ref.coinbase_products
 uv run python -m marketlake.transform build       # dbt: snapshot, models, tests
+uv run dagster dev                                # orchestration UI on :3000 (turn schedules on there)
 uv run pytest
 ```
 
@@ -95,6 +96,18 @@ Data quality tests:
 
 `tests/test_dbt.py` runs real `dbt build`/`snapshot`/`test` against the pytest Spark session in CI. It covers correct bars, SCD2 versioning across a status/tick change and a delisting, late trades picked up by the incremental lookback, and an outlier failing the build.
 
+### Orchestration (Dagster)
+
+`src/marketlake/orchestration/definitions.py`. The streaming job runs continuously outside Dagster; `silver/trades` and `gold/bars_1m` are declared as external assets so lineage and checks attach to them.
+
+| job | schedule | what |
+|---|---|---|
+| `refresh_reference` | daily 00:15 | `ref/coinbase_products` |
+| `build_dbt` | every 30 min | all dbt models + snapshot (dagster-dbt); the 14 single-model dbt tests appear as asset checks |
+| `check_streaming` | every 10 min | `silver_trades_fresh` (newest ingest < 10 min old, warn) and `silver_reject_rate` (quarantined share of the last 24h ≤ 1%) |
+| `compact_and_expire` | hourly | `maintenance` compact + expire on every table |
+| `remove_orphans` | daily 03:30 | orphan-file cleanup |
+
 ## Findings
 
 Problems that came up while running the pipeline live:
@@ -105,6 +118,7 @@ Problems that came up while running the pipeline live:
 4. **Gap state doesn't survive process restarts.** The gap detector catches holes across websocket reconnects, but a fresh process starts with empty state, so downtime between runs goes undetected. Phase 4: seed it from `max(trade_id)` per symbol in silver at startup ([#8](../../issues/8)).
 5. **Well-formed garbage passes every structural check.** A trade priced at 1.00 (BTC ~65,000) is valid JSON, has every field, and is internally consistent as a bar (`low ≤ close ≤ high`). It reached silver and set BTC's daily low and close. Only a semantic check (price vs daily VWAP) caught it, so that test now exists.
 6. **Rolling back a checkpoint's offsets silently drops gold bars.** The Iceberg streaming sink skips any epoch ≤ the last one it committed for that query id. After a forced replay re-planned later epochs under reused ids, bars were skipped without any error. The reconciliation report surfaced 8 missing minutes. A fresh checkpoint (new query id) is safe; editing one in place is not.
+7. **Spark's progress bar ate a dbt event.** dagster-dbt parses dbt's stdout as a stream of JSON events, and Spark's console progress bar writes to the same stdout. A `[Stage 36: …]\r` line glued to `fct_bars_1d`'s success event made it unparseable, so Dagster silently recorded no materialization for that model (the run still succeeded). It's intermittent, since it only hits events emitted while a stage is running. Fixed with `spark.ui.showConsoleProgress=false` in `spark_conf()`.
 
 ## Fault-injection testing (2026-11-15)
 
