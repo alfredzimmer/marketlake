@@ -6,7 +6,9 @@ silver  Every valid trade, deduplicated on (exchange, symbol, trade_id).
         Written with foreachBatch + MERGE INTO ... WHEN NOT MATCHED INSERT, so
         replaying a micro-batch (after a crash between the Iceberg commit and the
         checkpoint commit) inserts nothing new: idempotent, effectively once.
-        No watermark: late trades are always accepted here.
+        No watermark: late trades are always accepted here. Records failing
+        parsing/validation go to quarantine.trades (raw bytes + reason, MERGE on
+        Kafka partition/offset) instead of being dropped.
 
 gold    1-minute OHLCV + VWAP bars per (exchange, symbol), event-time windows with
         a watermark. Append mode emits each bar exactly once, after the watermark
@@ -54,6 +56,10 @@ TRADE_JSON = StructType([
     StructField("ingest_ts", StringType()),
 ])
 
+REQUIRED = ["exchange", "symbol", "trade_id", "price", "size", "taker_side",
+            "event_ts", "ingest_ts"]
+QUARANTINE_COLUMNS = ["kafka_partition", "kafka_offset", "kafka_ts", "raw_value",
+                      "reject_reason", "quarantined_at"]
 SILVER_COLUMNS = ["exchange", "symbol", "trade_id", "price", "size", "taker_side",
                   "event_ts", "ingest_ts", "kafka_partition", "kafka_offset"]
 
@@ -69,16 +75,25 @@ def read_kafka(spark: SparkSession, bootstrap: str, max_offsets: int) -> DataFra
     )
 
 
-def parse_trades(kafka_df: DataFrame) -> DataFrame:
-    t = F.from_json(F.col("value").cast("string"), TRADE_JSON)
+def parse_kafka(kafka_df: DataFrame) -> DataFrame:
+    """Parses every Kafka record and tags it with `reject_reason` (null when
+    the record is valid). Keeps the raw value and Kafka coordinates so rejects
+    can be quarantined."""
+    raw = F.col("value").cast("string")
+    t = F.from_json(raw, TRADE_JSON)
     parsed = kafka_df.select(
         t.alias("t"),
+        F.col("value").alias("raw_value"),
         F.col("partition").alias("kafka_partition"),
         F.col("offset").alias("kafka_offset"),
+        F.col("timestamp").alias("kafka_ts"),
+        F.get_json_object(raw, "$").isNotNull().alias("_is_json"),
     ).select(
         "t.exchange",
         "t.symbol",
         "t.trade_id",
+        # try_cast: Spark 4 runs in ANSI mode, where a plain cast of one
+        # malformed value throws and kills the stream.
         F.col("t.price").try_cast(PRICE).alias("price"),
         F.col("t.size").try_cast(PRICE).alias("size"),
         "t.taker_side",
@@ -86,15 +101,22 @@ def parse_trades(kafka_df: DataFrame) -> DataFrame:
         F.col("t.ingest_ts").try_cast("timestamp").alias("ingest_ts"),
         "kafka_partition",
         "kafka_offset",
+        "kafka_ts",
+        "raw_value",
+        "_is_json",
     )
-    # try_cast: Spark 4 runs in ANSI mode, where a plain cast of one malformed
-    # value throws and kills the stream. Malformed records (unparseable JSON,
-    # bad decimals/timestamps) become nulls and are kept out of the typed
-    # layers; bronze still has the raw bytes.
-    return parsed.where(
-        F.col("trade_id").isNotNull() & F.col("price").isNotNull()
-        & F.col("size").isNotNull() & F.col("event_ts").isNotNull()
-    )
+    # Every NOT NULL silver column must be checked: one null in a required
+    # Iceberg column fails the whole write, and the stream would then fail on
+    # the same record after every restart (#7).
+    reason = F.when(~F.col("_is_json"), F.lit("invalid json"))
+    for col in REQUIRED:
+        reason = reason.when(F.col(col).isNull(), F.lit(f"missing or invalid {col}"))
+    return parsed.withColumn("reject_reason", reason).drop("_is_json")
+
+
+def parse_trades(kafka_df: DataFrame) -> DataFrame:
+    """Valid trades only."""
+    return parse_kafka(kafka_df).where(F.col("reject_reason").isNull()).select(*SILVER_COLUMNS)
 
 
 def merge_silver(batch: DataFrame, batch_id: int) -> None:
@@ -118,6 +140,34 @@ def merge_silver(batch: DataFrame, batch_id: int) -> None:
             AND t.event_ts BETWEEN TIMESTAMP '{lo}' AND TIMESTAMP '{hi}'
             WHEN NOT MATCHED THEN INSERT *
         """)
+    finally:
+        batch.unpersist()
+
+
+def quarantine_rejects(rejects: DataFrame) -> None:
+    rejects.createOrReplaceTempView("quarantine_batch")
+    rejects.sparkSession.sql("""
+        MERGE INTO quarantine.trades t
+        USING quarantine_batch s
+        ON t.kafka_partition = s.kafka_partition AND t.kafka_offset = s.kafka_offset
+        WHEN NOT MATCHED THEN INSERT *
+    """)
+
+
+def write_silver(batch: DataFrame, batch_id: int) -> None:
+    """foreachBatch sink: valid rows MERGE into silver, rejects into quarantine."""
+    batch = batch.persist()
+    try:
+        rejects = (batch.where(F.col("reject_reason").isNotNull())
+                   .withColumn("quarantined_at", F.current_timestamp())
+                   .select(*QUARANTINE_COLUMNS)).persist()
+        n_rejected = rejects.count()
+        if n_rejected:
+            quarantine_rejects(rejects)
+            log.warning("silver batch=%d quarantined=%d", batch_id, n_rejected)
+        rejects.unpersist()
+        merge_silver(batch.where(F.col("reject_reason").isNull()).select(*SILVER_COLUMNS),
+                     batch_id)
     finally:
         batch.unpersist()
 
@@ -198,11 +248,12 @@ def main() -> None:
     spark.streams.addListener(ProgressLogger())
     create_all(spark)
 
-    trades = parse_trades(read_kafka(spark, args.bootstrap, args.max_offsets))
+    records = parse_kafka(read_kafka(spark, args.bootstrap, args.max_offsets))
+    trades = records.where(F.col("reject_reason").isNull()).select(*SILVER_COLUMNS)
 
     silver = (
-        trades.select(*SILVER_COLUMNS).writeStream.queryName("silver_trades")
-        .foreachBatch(merge_silver)
+        records.writeStream.queryName("silver_trades")
+        .foreachBatch(write_silver)
         .option("checkpointLocation", os.path.join(args.checkpoints, "silver_trades"))
         .trigger(processingTime=args.trigger)
         .start()
