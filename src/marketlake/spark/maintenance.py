@@ -1,6 +1,7 @@
 """One-off table maintenance.
 
-Run: uv run python -m marketlake.spark.maintenance dedupe-silver
+Run (with the streaming job stopped):
+    uv run python -m marketlake.spark.maintenance dedupe-silver
 """
 
 from __future__ import annotations
@@ -25,13 +26,21 @@ DEDUPE_SILVER = """
 
 def dedupe_silver(spark: SparkSession) -> tuple[int, int]:
     """Removes duplicate (exchange, symbol, trade_id) rows, keeping the earliest
-    Kafka record. Cleans up after #1. Returns (rows_before, rows_after)."""
+    Kafka record. Cleans up after #1. Returns (rows_before, rows_after).
+
+    Stop the streaming job first: the overwrite replaces every partition with
+    the deduplicated snapshot it read, so trades committed by the stream while
+    it runs could be overwritten.
+    """
     before = spark.table("silver.trades").count()
-    # Dynamic overwrite only rewrites the day/exchange partitions present in
-    # the result, which is all of them here, but keeps the operation
-    # partition-scoped rather than a full-table truncate.
+    # Dynamic mode replaces only the partitions present in the result (all of
+    # them here) instead of truncating the table first.
+    previous = spark.conf.get("spark.sql.sources.partitionOverwriteMode", "static")
     spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
-    spark.sql(DEDUPE_SILVER)
+    try:
+        spark.sql(DEDUPE_SILVER)
+    finally:
+        spark.conf.set("spark.sql.sources.partitionOverwriteMode", previous)
     return before, spark.table("silver.trades").count()
 
 
