@@ -1,20 +1,7 @@
 import json
 from decimal import Decimal
 
-import pytest
-from pyspark.sql import SparkSession
-
 from marketlake.spark.stream_trades import bars_1m, parse_trades
-
-
-@pytest.fixture(scope="module")
-def spark():
-    s = (SparkSession.builder.master("local[1]").appName("tests")
-         .config("spark.sql.session.timeZone", "UTC")
-         .config("spark.sql.shuffle.partitions", "1")
-         .getOrCreate())
-    yield s
-    s.stop()
 
 
 def kafka_rows(spark, trades, extra_values=()):

@@ -49,7 +49,7 @@ uv run pytest
 
 ### Phase 2: stream processing
 
-- **Silver writes are idempotent (`MERGE ... WHEN NOT MATCHED INSERT`).** Spark commits the Iceberg snapshot and then the checkpoint. A crash between the two replays the micro-batch, and the MERGE inserts nothing the second time. The intended result is exactly-once table contents on top of at-least-once delivery. **Currently broken on non-UTC machines:** see [#1](../../issues/1). The MERGE condition also bounds target `event_ts` to the batch's min/max, so Iceberg prunes to the touched day partitions instead of scanning the whole table.
+- **Silver writes are idempotent (`MERGE ... WHEN NOT MATCHED INSERT`).** Spark commits the Iceberg snapshot and then the checkpoint. A crash between the two replays the micro-batch, and the MERGE inserts nothing the second time. The result is exactly-once table contents on top of at-least-once delivery. The MERGE bounds are rendered inside Spark; collecting them as Python datetimes once shifted them by the local UTC offset and broke this ([#1](../../issues/1)). The MERGE condition also bounds target `event_ts` to the batch's min/max, so Iceberg prunes to the touched day partitions instead of scanning the whole table.
 - **Silver has no watermark; gold does.** Silver accepts every trade, however late. Gold bars use a 30s event-time watermark in append mode, so each bar is written once, after its window closes. Trades later than the watermark are dropped from the *streaming* bars and counted per batch (`late_dropped`). Phase 4 reconciles the bars against a batch recompute from silver.
 - **Dedupe in both layers.** Silver dedupes on the MERGE key. Gold uses `dropDuplicatesWithinWatermark`, which keeps dedupe state bounded by the watermark instead of growing forever. The same `bars_1m()` function runs on batch DataFrames (falling back to a full `dropDuplicates`), so stream and batch share one definition of a bar.
 - **Open/close by `trade_id`, not arrival order.** `min_by(price, trade_id)` / `max_by(price, trade_id)` stay correct when events arrive out of order inside a window.
@@ -70,7 +70,7 @@ Problems that came up while running the pipeline live:
 | test | result | issue |
 |---|---|---|
 | Clean clone → `uv sync` → `pytest` | ✅ 8/8 pass | |
-| Replay a committed **silver** batch (delete checkpoint commit) | ❌ +328 duplicate rows: MERGE bounds shifted by local TZ | [#1](../../issues/1) |
+| Replay a committed **silver** batch (delete checkpoint commit) | ❌ → ✅ +328 duplicate rows from MERGE bounds shifted by local TZ; after fix a 2,549-row replay adds 0 | [#1](../../issues/1) |
 | Replay a committed **gold** epoch that emitted bars | ✅ skipped via Iceberg `epochId` in snapshot summary; 0 duplicate bars | |
 | `kill -9` stream job ×3 during live ingest, then drain | ✅ silver: 0 missing of 17,886 trades; gold: 33/33 bars match batch recompute (OHLC, VWAP, volume, count) | |
 | Malformed JSON / non-numeric price into `trades.raw` | ✅ stream skips them ❌ bronze sink crash-loops; ⚠️ stream drops are uncounted | [#3](../../issues/3), [#7](../../issues/7) |
