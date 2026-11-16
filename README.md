@@ -59,13 +59,21 @@ uv run pytest
 - **`try_cast` on parse.** Spark 4 defaults to ANSI mode, where one malformed price throws and fails the query. A unit test caught this.
 - **Rejects are quarantined, not dropped.** Each record is tagged with a `reject_reason` covering every NOT NULL silver column. A single null in a required Iceberg column fails the whole write, so a partial check is a crash waiting to happen. Rejects go to `quarantine.trades` with their raw bytes, merged on Kafka partition/offset so replays don't duplicate them, and counts are logged per batch.
 
+### Table maintenance
+
+`uv run python -m marketlake.spark.maintenance {compact|expire|orphans|all}` runs over silver, gold and quarantine, and is safe while the stream is writing.
+
+- **compact:** `rewrite_data_files` (bin-pack to 128 MB, `partial-progress` so a conflict with a streaming commit only retries one file group) + `rewrite_manifests`.
+- **expire:** snapshots older than 24h, but **always keeps the last 100**. The Iceberg streaming sink makes gold replays idempotent by finding its last epoch id in snapshot history. If compaction commits after the stream and expiry keeps only that snapshot, the marker is gone and a replayed epoch is appended twice. A test reproduces this.
+- **orphans:** files older than 3 days that no snapshot references (younger files may belong to an in-flight commit). Uses `prefix_listing` so it lists through Iceberg's S3FileIO; the default Hadoop listing has no `s3://` filesystem.
+
 ## Findings
 
 Problems that came up while running the pipeline live:
 
 1. **SQLite can't back a catalog with concurrent writers.** The Iceberg REST fixture uses SQLite. Once two streaming queries committed at the same time, commits failed with `SQLITE_BUSY` (surfacing in Spark as `CommitStateUnknownException`). Fix: build the fixture image with the Postgres JDBC driver and point the catalog at Postgres (`infra/iceberg-rest/Dockerfile`).
 2. **Overlapping ingestors duplicate data, and the pipeline absorbs it.** Two ingestor processes ran at once for about 75s by accident. Kafka ended up with 10,376 records but only 9,037 distinct trades. Silver held exactly 9,037 rows with 0 missing, and all 21 gold bars matched a batch recompute from silver (count, volume, close), including the overlap windows.
-3. **The streaming small-files problem is real.** After about 20 micro-batches, silver had 152 data files averaging 3.9 KB (8.6k rows). Compaction (`rewrite_data_files`) is planned for phase 4, with before/after query timings.
+3. **Small files came from the write path, not just batch size.** Every silver commit wrote exactly 8 files, even for 16 rows. Spark disables AQE for streaming micro-batches, so the MERGE's sort-order range shuffle wrote one file per shuffle partition (8). At a 10s trigger that's ~69k files/day. Re-enabling AQE for the MERGE (a normal batch query inside `foreachBatch`) plus `write.spark.advisory-partition-size-bytes` brought it to **1 file per commit** live. Compaction (`maintenance compact`) handles the rest: 177 → 18 files, 21 → 1 manifests, run while the stream was writing. Query time on the same data: 159 ms at 41 files vs 362 ms at 194 files.
 4. **Gap state doesn't survive process restarts.** The gap detector catches holes across websocket reconnects, but a fresh process starts with empty state, so downtime between runs goes undetected. Phase 4: seed it from `max(trade_id)` per symbol in silver at startup ([#8](../../issues/8)).
 
 ## Fault-injection testing (2026-11-15)
@@ -82,7 +90,9 @@ Problems that came up while running the pipeline live:
 | Kafka down 20s (8s delivery timeout) | ❌ → ✅ 804/1,678 trades silently lost; now spilled to a local journal and replayed: 848 spilled, 848 replayed, 3,001/3,001 in Kafka, 0 duplicates | [#2](../../issues/2) |
 | Websocket handshake rejected | ❌ → ✅ ingestor exited (`InvalidStatus`); now backs off (honoring `Retry-After`) and skips malformed messages, which surface as gaps | [#4](../../issues/4) |
 | `rpk` vs Python producer, same key | ⚠️ partition 5 vs 1 (murmur2 vs CRC32) | [#5](../../issues/5) |
-| Gold snapshot history | ⚠️ empty snapshot every 10s trigger | [#6](../../issues/6) |
+| Gold snapshot history | ⚠️ → ✅ empty snapshot every 10s trigger; now expired by `maintenance expire` | [#6](../../issues/6) |
+| `maintenance all` while ingest + stream are writing | ✅ no conflicts; stream kept committing; silver 28,585/28,585 distinct, gold 60/60 | |
+| Replay a gold epoch after compaction + expiry | ✅ idempotent with `retain_last=100`; ❌ with `retain_last=1` the epoch marker is expired and the replay appends duplicates (35 rows vs 30), now a regression test | |
 
 ## Results log
 

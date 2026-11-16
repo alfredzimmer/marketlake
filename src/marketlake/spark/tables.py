@@ -37,6 +37,9 @@ DDL = [
     )
     """,
     "ALTER TABLE silver.trades WRITE ORDERED BY symbol, trade_id",
+    # AQE coalesces the write shuffle toward this size; also applied to tables
+    # created before it was added.
+    "ALTER TABLE silver.trades SET TBLPROPERTIES ('write.spark.advisory-partition-size-bytes' = '134217728')",
     """
     CREATE TABLE IF NOT EXISTS gold.bars_1m (
         exchange     STRING    NOT NULL,

@@ -131,6 +131,12 @@ def merge_silver(batch: DataFrame, batch_id: int) -> None:
         if lo is None:
             return
         batch.createOrReplaceTempView("silver_batch")
+        # Spark disables AQE in the session micro-batches run on. Without it the
+        # MERGE's sort-order range shuffle writes one file per shuffle
+        # partition: 8 files for a 16-row batch, ~69k files/day at a 10s
+        # trigger. The MERGE is an ordinary batch query, so turn AQE back on
+        # and let it coalesce toward the table's advisory partition size.
+        batch.sparkSession.conf.set("spark.sql.adaptive.enabled", "true")
         # The event_ts bound on the target lets Iceberg prune to the day
         # partitions this batch touches instead of scanning the whole table.
         batch.sparkSession.sql(f"""
