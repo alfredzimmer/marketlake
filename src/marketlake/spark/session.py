@@ -35,6 +35,10 @@ def spark_conf() -> dict[str, str]:
         "spark.sql.defaultCatalog": "lake",
         "spark.sql.session.timeZone": "UTC",
         "spark.sql.shuffle.partitions": "8",
+        # The console progress bar writes "[Stage N: ...]\r" to stdout. Under
+        # dagster-dbt that stdout is dbt's JSON event stream, so a progress line
+        # glued to an event made it unparseable and its materialization was lost.
+        "spark.ui.showConsoleProgress": "false",
     }
 
 
