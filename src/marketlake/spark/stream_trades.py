@@ -100,7 +100,12 @@ def parse_trades(kafka_df: DataFrame) -> DataFrame:
 def merge_silver(batch: DataFrame, batch_id: int) -> None:
     batch = batch.dropDuplicates(KEY).persist()
     try:
-        lo, hi = batch.agg(F.min("event_ts"), F.max("event_ts")).first()
+        # Render the bounds as strings inside Spark (session TZ = UTC). Collecting
+        # them as Python datetimes would convert to the *process's* local zone,
+        # and the TIMESTAMP literals below would then be off by the UTC offset,
+        # so the MERGE would never match and replays would duplicate rows (#1).
+        lo, hi = batch.agg(F.min("event_ts").cast("string"),
+                           F.max("event_ts").cast("string")).first()
         if lo is None:
             return
         batch.createOrReplaceTempView("silver_batch")
@@ -110,7 +115,7 @@ def merge_silver(batch: DataFrame, batch_id: int) -> None:
             MERGE INTO silver.trades t
             USING silver_batch s
             ON  t.exchange = s.exchange AND t.symbol = s.symbol AND t.trade_id = s.trade_id
-            AND t.event_ts BETWEEN TIMESTAMP '{lo.isoformat()}' AND TIMESTAMP '{hi.isoformat()}'
+            AND t.event_ts BETWEEN TIMESTAMP '{lo}' AND TIMESTAMP '{hi}'
             WHEN NOT MATCHED THEN INSERT *
         """)
     finally:
