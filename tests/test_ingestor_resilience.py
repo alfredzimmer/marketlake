@@ -101,3 +101,28 @@ def test_malformed_messages_are_skipped_not_fatal():
     # The skipped trade surfaces as a gap, so the backfiller can recover it.
     gaps = [v for t, _, v in producer.messages if t == "ingest.gaps"]
     assert [(g["first_missing"], g["last_missing"]) for g in gaps] == [(2, 2)]
+
+
+def test_server_side_close_backs_off_instead_of_hot_looping():
+    attempts = []
+
+    async def handler(ws):
+        attempts.append(time.monotonic())
+        await ws.recv()  # subscribe, then close immediately
+
+    async def main():
+        async with serve(handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            ing = CoinbaseIngestor(["BTC-USD"], FakeProducer(), ws_url=f"ws://127.0.0.1:{port}",
+                                   initial_backoff=0.1, max_backoff=0.4)
+            task = asyncio.create_task(ing.run())
+            await asyncio.sleep(1.0)
+            ing.stop()
+            await task
+            return ing
+
+    ing = asyncio.run(main())
+    # Delays 0.1, 0.2, 0.4, 0.4 (+jitter) fit at most ~4 attempts in 1 s;
+    # without backoff this loop reconnects hundreds of times.
+    assert 2 <= len(attempts) <= 5
+    assert ing.stats.reconnects >= len(attempts) - 1
