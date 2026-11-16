@@ -34,6 +34,9 @@ TRADES_TOPIC = "trades.raw"
 GAPS_TOPIC = "ingest.gaps"
 # Cap on a server-requested wait, so a bogus header can't park us for hours.
 MAX_RETRY_AFTER_S = 300.0
+# A session that streamed at least this long counts as healthy: the next
+# disconnect starts backoff over instead of continuing to escalate.
+HEALTHY_SESSION_S = 30.0
 
 log = logging.getLogger("ingest.coinbase")
 
@@ -221,6 +224,10 @@ class CoinbaseIngestor:
                 self.handle(raw)
                 if self._stop.is_set():
                     return
+        if not self._stop.is_set():
+            # A clean close from the server is still a disconnect; without this
+            # it would skip backoff and reconnect in a tight loop.
+            raise ConnectionError("server closed the connection")
 
     async def run(self) -> None:
         backoff = self.initial_backoff
@@ -228,12 +235,14 @@ class CoinbaseIngestor:
         replayer = asyncio.create_task(self._replay_loop())
         try:
             while not self._stop.is_set():
+                started = time.monotonic()
                 try:
                     await self._session()
-                    backoff = self.initial_backoff
                 except (WebSocketException, OSError, RuntimeError) as e:
                     # WebSocketException covers ConnectionClosed and handshake
                     # rejections (InvalidStatus on 429/5xx during maintenance).
+                    if time.monotonic() - started >= HEALTHY_SESSION_S:
+                        backoff = self.initial_backoff
                     self.stats.reconnects += 1
                     delay = max(backoff + random.uniform(0, backoff / 2), retry_after(e))
                     log.warning("connection lost (%s); reconnecting in %.1fs", e, delay)
