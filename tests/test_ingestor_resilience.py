@@ -1,6 +1,8 @@
 import asyncio
 import json
+import tempfile
 import time
+from pathlib import Path
 from http import HTTPStatus
 
 from websockets.asyncio.server import serve
@@ -57,7 +59,8 @@ def run_against(rejections, frames, timeout=10):
         async with serve(handler, "127.0.0.1", 0, process_request=process_request) as server:
             port = server.sockets[0].getsockname()[1]
             ingestor = CoinbaseIngestor(["BTC-USD"], producer, ws_url=f"ws://127.0.0.1:{port}",
-                                        initial_backoff=0.01, max_backoff=0.05)
+                                        initial_backoff=0.01, max_backoff=0.05,
+                                        spill_path=Path(tempfile.mkdtemp()) / "spill.jsonl")
             await asyncio.wait_for(ingestor.run(), timeout)
 
     asyncio.run(main())
@@ -114,7 +117,8 @@ def test_server_side_close_backs_off_instead_of_hot_looping():
         async with serve(handler, "127.0.0.1", 0) as server:
             port = server.sockets[0].getsockname()[1]
             ing = CoinbaseIngestor(["BTC-USD"], FakeProducer(), ws_url=f"ws://127.0.0.1:{port}",
-                                   initial_backoff=0.1, max_backoff=0.4)
+                                   initial_backoff=0.1, max_backoff=0.4,
+                                   spill_path=Path(tempfile.mkdtemp()) / "spill.jsonl")
             task = asyncio.create_task(ing.run())
             await asyncio.sleep(1.0)
             ing.stop()
