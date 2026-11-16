@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 
 import websockets
 from confluent_kafka import Producer
+from websockets.exceptions import InvalidStatus, WebSocketException
 
 from marketlake.ingest.gaps import GapDetector
 from marketlake.models import Trade
@@ -29,6 +30,8 @@ WS_URL = "wss://ws-feed.exchange.coinbase.com"
 EXCHANGE = "coinbase"
 TRADES_TOPIC = "trades.raw"
 GAPS_TOPIC = "ingest.gaps"
+# Cap on a server-requested wait, so a bogus header can't park us for hours.
+MAX_RETRY_AFTER_S = 300.0
 
 log = logging.getLogger("ingest.coinbase")
 
@@ -48,24 +51,40 @@ def parse_match(msg: dict, ingest_ts: str) -> Trade:
     )
 
 
+def retry_after(e: Exception) -> float:
+    """Seconds requested by a 429/503 Retry-After header, else 0."""
+    if not isinstance(e, InvalidStatus):
+        return 0.0
+    try:
+        seconds = float(e.response.headers.get("Retry-After", 0))
+    except ValueError:  # HTTP-date form; fall back to our own backoff
+        return 0.0
+    return min(seconds, MAX_RETRY_AFTER_S)
+
+
 class Stats:
     def __init__(self) -> None:
         self.trades = self.dupes = self.gaps = self.missing = self.reconnects = 0
+        self.malformed = 0
         self._t0 = time.monotonic()
 
     def report(self) -> None:
         elapsed = time.monotonic() - self._t0
         log.info(
-            "trades=%d (%.1f/s) dupes=%d gaps=%d missing_ids=%d reconnects=%d",
+            "trades=%d (%.1f/s) dupes=%d gaps=%d missing_ids=%d malformed=%d reconnects=%d",
             self.trades, self.trades / max(elapsed, 1e-9), self.dupes,
-            self.gaps, self.missing, self.reconnects,
+            self.gaps, self.missing, self.malformed, self.reconnects,
         )
 
 
 class CoinbaseIngestor:
-    def __init__(self, symbols: list[str], producer: Producer) -> None:
+    def __init__(self, symbols: list[str], producer: Producer, ws_url: str = WS_URL,
+                 initial_backoff: float = 1.0, max_backoff: float = 60.0) -> None:
         self.symbols = symbols
         self.producer = producer
+        self.ws_url = ws_url
+        self.initial_backoff = initial_backoff
+        self.max_backoff = max_backoff
         # Lives across reconnects, so a disconnect shows up as a gap.
         self.detector = GapDetector(EXCHANGE)
         self.stats = Stats()
@@ -79,14 +98,24 @@ class CoinbaseIngestor:
             log.error("delivery failed for key=%s: %s", msg.key(), err)
 
     def handle(self, raw: str) -> None:
-        msg = json.loads(raw)
-        kind = msg.get("type")
+        try:
+            msg = json.loads(raw)
+            kind = msg.get("type")
+        except (json.JSONDecodeError, AttributeError):
+            self._malformed(raw, "not a JSON object")
+            return
         if kind == "error":
             raise RuntimeError(f"coinbase error: {msg}")
         if kind not in ("match", "last_match"):
             return
 
-        trade = parse_match(msg, datetime.now(UTC).isoformat())
+        try:
+            trade = parse_match(msg, datetime.now(UTC).isoformat())
+        except (KeyError, TypeError, ValueError) as e:
+            # One bad message (e.g. an upstream schema change) must not kill
+            # the ingestor; count it so a spike is visible.
+            self._malformed(raw, f"{type(e).__name__}: {e}")
+            return
         is_new, gap = self.detector.observe(trade.symbol, trade.trade_id)
         if not is_new:
             self.stats.dupes += 1
@@ -102,8 +131,12 @@ class CoinbaseIngestor:
         self.producer.poll(0)
         self.stats.trades += 1
 
+    def _malformed(self, raw: str, reason: str) -> None:
+        self.stats.malformed += 1
+        log.warning("skipping malformed message (%s): %.200s", reason, raw)
+
     async def _session(self) -> None:
-        async with websockets.connect(WS_URL, ping_interval=20, max_queue=4096) as ws:
+        async with websockets.connect(self.ws_url, ping_interval=20, max_queue=4096) as ws:
             await ws.send(json.dumps({
                 "type": "subscribe",
                 "product_ids": self.symbols,
@@ -116,22 +149,24 @@ class CoinbaseIngestor:
                     return
 
     async def run(self) -> None:
-        backoff = 1.0
+        backoff = self.initial_backoff
         reporter = asyncio.create_task(self._report_loop())
         try:
             while not self._stop.is_set():
                 try:
                     await self._session()
-                    backoff = 1.0
-                except (websockets.ConnectionClosed, OSError, RuntimeError) as e:
+                    backoff = self.initial_backoff
+                except (WebSocketException, OSError, RuntimeError) as e:
+                    # WebSocketException covers ConnectionClosed and handshake
+                    # rejections (InvalidStatus on 429/5xx during maintenance).
                     self.stats.reconnects += 1
-                    delay = backoff + random.uniform(0, backoff / 2)
+                    delay = max(backoff + random.uniform(0, backoff / 2), retry_after(e))
                     log.warning("connection lost (%s); reconnecting in %.1fs", e, delay)
                     try:
                         await asyncio.wait_for(self._stop.wait(), timeout=delay)
                     except TimeoutError:
                         pass
-                    backoff = min(backoff * 2, 60.0)
+                    backoff = min(backoff * 2, self.max_backoff)
         finally:
             reporter.cancel()
             remaining = self.producer.flush(10)

@@ -76,7 +76,7 @@ Problems that came up while running the pipeline live:
 | Malformed JSON / non-numeric price into `trades.raw` | ✅ stream skips them ❌ bronze sink crash-loops; ⚠️ stream drops are uncounted | [#3](../../issues/3), [#7](../../issues/7) |
 | Trade 2h older than watermark | ✅ kept in silver, excluded from gold, `late_dropped=1` | |
 | Kafka down 20s (8s delivery timeout) | ❌ 804/1,678 trades silently lost, 0 gaps flagged | [#2](../../issues/2) |
-| Websocket handshake rejected | ❌ ingestor exits (`InvalidStatus`) | [#4](../../issues/4) |
+| Websocket handshake rejected | ❌ → ✅ ingestor exited (`InvalidStatus`); now backs off (honoring `Retry-After`) and skips malformed messages, which surface as gaps | [#4](../../issues/4) |
 | `rpk` vs Python producer, same key | ⚠️ partition 5 vs 1 (murmur2 vs CRC32) | [#5](../../issues/5) |
 | Gold snapshot history | ⚠️ empty snapshot every 10s trigger | [#6](../../issues/6) |
 
