@@ -46,7 +46,7 @@ uv run pytest
 
 ## Design decisions
 
-- **Partition key = `exchange:symbol`.** Keeps each symbol's trades in order within one partition, which gap detection and stateful windows downstream rely on.
+- **Partition key = `exchange:symbol`, murmur2 partitioner.** Keeps each symbol's trades in order within one partition, which gap detection and stateful windows downstream rely on. librdkafka defaults to CRC32, so the ingestor sets `murmur2_random` to place keys exactly like Java clients, Kafka Connect and `rpk` do ([#5](../../issues/5)).
 - **Idempotent producer (`enable.idempotence`, `acks=all`).** Producer retries can't duplicate records in the log.
 - **No silent loss when Kafka is down.** Records that fail delivery (timeout, full local queue, still queued at shutdown) go to an fsynced local journal (`data/spill/`). They are replayed once the broker accepts writes, and the journal batch is deleted only after every record is acknowledged. Replayed records never re-spill, so the journal can't grow on retries during an outage.
 - **Prices as decimal strings.** No float round-trips at ingest; typing happens in silver.
@@ -136,7 +136,7 @@ Problems that came up while running the pipeline live:
 | Trade 2h older than watermark | ✅ kept in silver, excluded from gold, `late_dropped=1` | |
 | Kafka down 20s (8s delivery timeout) | ❌ → ✅ 804/1,678 trades silently lost; now spilled to a local journal and replayed: 848 spilled, 848 replayed, 3,001/3,001 in Kafka, 0 duplicates | [#2](../../issues/2) |
 | Websocket handshake rejected | ❌ → ✅ ingestor exited (`InvalidStatus`); now backs off (honoring `Retry-After`) and skips malformed messages, which surface as gaps | [#4](../../issues/4) |
-| `rpk` vs Python producer, same key | ⚠️ partition 5 vs 1 (murmur2 vs CRC32) | [#5](../../issues/5) |
+| `rpk` vs Python producer, same key | ⚠️ → ✅ partition 5 vs 1 (murmur2 vs CRC32); the ingestor now uses murmur2, checked against Java's algorithm on librdkafka's mock cluster | [#5](../../issues/5) |
 | Gold snapshot history | ⚠️ → ✅ empty snapshot every 10s trigger; now expired by `maintenance expire` | [#6](../../issues/6) |
 | `maintenance all` while ingest + stream are writing | ✅ no conflicts; stream kept committing; silver 28,585/28,585 distinct, gold 60/60 | |
 | Replay a gold epoch after compaction + expiry | ✅ idempotent with `retain_last=100`; ❌ with `retain_last=1` the epoch marker is expired and the replay appends duplicates (35 rows vs 30), now a regression test | |
