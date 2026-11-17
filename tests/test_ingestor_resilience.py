@@ -31,6 +31,11 @@ def match(trade_id, **overrides):
     return json.dumps(m | overrides)
 
 
+def scratch_paths():
+    d = Path(tempfile.mkdtemp())
+    return {"spill_path": d / "spill.jsonl", "state_path": d / "trade_ids.json"}
+
+
 def run_against(rejections, frames, timeout=10):
     """Fake exchange: rejects the first handshakes with the given (status,
     headers), then accepts, sends `frames`, and closes."""
@@ -60,7 +65,7 @@ def run_against(rejections, frames, timeout=10):
             port = server.sockets[0].getsockname()[1]
             ingestor = CoinbaseIngestor(["BTC-USD"], producer, ws_url=f"ws://127.0.0.1:{port}",
                                         initial_backoff=0.01, max_backoff=0.05,
-                                        spill_path=Path(tempfile.mkdtemp()) / "spill.jsonl")
+                                        **scratch_paths())
             await asyncio.wait_for(ingestor.run(), timeout)
 
     asyncio.run(main())
@@ -118,7 +123,7 @@ def test_server_side_close_backs_off_instead_of_hot_looping():
             port = server.sockets[0].getsockname()[1]
             ing = CoinbaseIngestor(["BTC-USD"], FakeProducer(), ws_url=f"ws://127.0.0.1:{port}",
                                    initial_backoff=0.1, max_backoff=0.4,
-                                   spill_path=Path(tempfile.mkdtemp()) / "spill.jsonl")
+                                   **scratch_paths())
             task = asyncio.create_task(ing.run())
             await asyncio.sleep(1.0)
             ing.stop()

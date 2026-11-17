@@ -26,6 +26,7 @@ from websockets.exceptions import InvalidStatus, WebSocketException
 
 from marketlake.ingest.gaps import GapDetector
 from marketlake.ingest.spill import SpillLog
+from marketlake.ingest.state import TradeIdState
 from marketlake.models import Trade
 
 WS_URL = "wss://ws-feed.exchange.coinbase.com"
@@ -37,6 +38,8 @@ MAX_RETRY_AFTER_S = 300.0
 # A session that streamed at least this long counts as healthy: the next
 # disconnect starts backoff over instead of continuing to escalate.
 HEALTHY_SESSION_S = 30.0
+# How often the durable trade-id marks are written to disk.
+STATE_SAVE_INTERVAL_S = 5.0
 
 log = logging.getLogger("ingest.coinbase")
 
@@ -87,14 +90,17 @@ class CoinbaseIngestor:
     def __init__(self, symbols: list[str], producer: Producer, ws_url: str = WS_URL,
                  initial_backoff: float = 1.0, max_backoff: float = 60.0,
                  spill_path: Path = Path("data/spill/coinbase.jsonl"),
+                 state_path: Path = Path("data/state/coinbase_trade_ids.json"),
                  replay_interval_s: float = 15.0) -> None:
         self.symbols = symbols
         self.producer = producer
         self.ws_url = ws_url
         self.initial_backoff = initial_backoff
         self.max_backoff = max_backoff
-        # Lives across reconnects, so a disconnect shows up as a gap.
-        self.detector = GapDetector(EXCHANGE)
+        # Lives across reconnects, and is seeded from the last run's durable
+        # marks, so both a disconnect and a restart show up as a gap.
+        self.state = TradeIdState(state_path)
+        self.detector = GapDetector(EXCHANGE, self.state.last())
         self.stats = Stats()
         self.spill = SpillLog(spill_path)
         self.replay_interval_s = replay_interval_s
@@ -107,14 +113,22 @@ class CoinbaseIngestor:
     def stop(self) -> None:
         self._stop.set()
 
+    def _durable(self, topic: str, value: bytes) -> None:
+        """Records that a trade is in Kafka or the spill journal."""
+        if topic == TRADES_TOPIC:
+            t = json.loads(value)
+            self.state.advance(t["symbol"], t["trade_id"])
+
     def _on_delivery(self, err, msg) -> None:
         if err is None:
             self._last_ok = time.monotonic()
+            self._durable(msg.topic(), msg.value())
             return
         # Without this, a broker outage longer than message.timeout.ms loses
         # trades silently: the gap detector already saw them as contiguous (#2).
         self._last_fail = time.monotonic()
         self.spill.append(msg.topic(), msg.key(), msg.value())
+        self._durable(msg.topic(), msg.value())
         self.stats.spilled += 1
         if self.stats.spilled % 1000 == 1:
             log.error("delivery failing (%s); spilled %d records to %s",
@@ -127,6 +141,7 @@ class CoinbaseIngestor:
             # Local queue full (broker down for a while): spill directly.
             self._last_fail = time.monotonic()
             self.spill.append(topic, key.encode() if isinstance(key, str) else key, value)
+            self._durable(topic, value)
             self.stats.spilled += 1
 
     def replay_spill(self, flush_timeout: float = 30.0) -> bool:
@@ -239,6 +254,7 @@ class CoinbaseIngestor:
         backoff = self.initial_backoff
         reporter = asyncio.create_task(self._report_loop())
         replayer = asyncio.create_task(self._replay_loop())
+        saver = asyncio.create_task(self._state_loop())
         try:
             while not self._stop.is_set():
                 started = time.monotonic()
@@ -260,6 +276,7 @@ class CoinbaseIngestor:
         finally:
             reporter.cancel()
             replayer.cancel()
+            saver.cancel()
             remaining = self.producer.flush(10)
             if remaining:
                 # Purging fires the delivery callback with an error for each
@@ -268,6 +285,7 @@ class CoinbaseIngestor:
                 self.producer.purge()
                 self.producer.poll(0)
             self.spill.close()
+            self.state.save()
             self.stats.report()
 
     async def _replay_loop(self) -> None:
@@ -279,6 +297,14 @@ class CoinbaseIngestor:
                 except Exception:
                     log.exception("spill replay failed; will retry")
             await asyncio.sleep(self.replay_interval_s)
+
+    async def _state_loop(self) -> None:
+        while True:
+            await asyncio.sleep(STATE_SAVE_INTERVAL_S)
+            try:
+                self.state.save()
+            except OSError:
+                log.exception("saving trade-id state failed; will retry")
 
     async def _report_loop(self) -> None:
         while True:
