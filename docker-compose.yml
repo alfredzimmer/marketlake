@@ -86,6 +86,25 @@ services:
       init-bucket:
         condition: service_completed_successfully
 
+  # Run Spark jobs inside the network instead of through the host port proxy
+  # (#18). Not started by `up`; use e.g.
+  #   docker compose run --rm spark python -m marketlake.spark.bench_files scan
+  spark:
+    build:
+      context: .
+      dockerfile: infra/spark/Dockerfile
+    profiles: [spark]
+    environment:
+      ICEBERG_REST_URI: http://iceberg-rest:8181
+      S3_ENDPOINT: http://seaweedfs:8333
+    volumes:
+      - ./src:/app/src:ro
+      - ./dbt:/app/dbt
+      - spark-ivy:/root/.ivy2.5.2
+    depends_on:
+      iceberg-rest:
+        condition: service_started
+
   init-topics:
     image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
     entrypoint: >
@@ -98,3 +117,4 @@ services:
 volumes:
   seaweed-data:
   catalog-data:
+  spark-ivy:
