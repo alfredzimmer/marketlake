@@ -1,0 +1,522 @@
+{
+  "uid": "marketlake-health",
+  "title": "Pipeline health",
+  "description": "Freshness, latency, data quality and storage health of the marketlake pipeline.",
+  "tags": [
+    "marketlake"
+  ],
+  "timezone": "utc",
+  "refresh": "10s",
+  "schemaVersion": 41,
+  "editable": false,
+  "time": {
+    "from": "now-3h",
+    "to": "now"
+  },
+  "templating": {
+    "list": []
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Seconds since last trade",
+      "description": "Newest ingest_ts in silver. Covers ingestor, Kafka and the Spark stream end to end.",
+      "datasource": {
+        "type": "trino-datasource",
+        "uid": "trino"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "trino-datasource",
+            "uid": "trino"
+          },
+          "rawSQL": "SELECT date_diff('second', max(ingest_ts), current_timestamp) AS seconds\nFROM lake.silver.trades\nWHERE event_ts > current_timestamp - INTERVAL '1' DAY",
+          "format": 1
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 60
+              },
+              {
+                "color": "red",
+                "value": 600
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Exchange \u2192 ingest p50 (5m)",
+      "description": "Exchange timestamp to our ingestor receiving it.",
+      "datasource": {
+        "type": "trino-datasource",
+        "uid": "trino"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "trino-datasource",
+            "uid": "trino"
+          },
+          "rawSQL": "SELECT approx_percentile(date_diff('millisecond', event_ts, ingest_ts), 0.5) AS p50_ms\nFROM lake.silver.trades\nWHERE event_ts > current_timestamp - INTERVAL '5' MINUTE",
+          "format": 1
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Quarantined (24h)",
+      "description": "Records that failed parsing or validation. Kept with raw bytes in quarantine.trades.",
+      "datasource": {
+        "type": "trino-datasource",
+        "uid": "trino"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "trino-datasource",
+            "uid": "trino"
+          },
+          "rawSQL": "SELECT count(*) AS rejects\nFROM lake.quarantine.trades\nWHERE quarantined_at > current_timestamp - INTERVAL '1' DAY",
+          "format": 1
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Stream vs batch mismatches",
+      "description": "Minutes where streaming gold.bars_1m disagrees with a batch recompute from silver (dbt rpt_bar_reconciliation, as of the last dbt build).",
+      "datasource": {
+        "type": "trino-datasource",
+        "uid": "trino"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "trino-datasource",
+            "uid": "trino"
+          },
+          "rawSQL": "SELECT count_if(status <> 'match') AS mismatched_minutes\nFROM lake.marts.rpt_bar_reconciliation",
+          "format": 1
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Trades into silver per minute",
+      "description": "A dip to zero that isn't market quiet is an ingest outage; the gap detector reports the missing trade ids on ingest.gaps.",
+      "datasource": {
+        "type": "trino-datasource",
+        "uid": "trino"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "trino-datasource",
+            "uid": "trino"
+          },
+          "rawSQL": "SELECT $__timeGroup(event_ts, '1m') AS time, symbol AS metric, count(*) AS trades\nFROM lake.silver.trades\nWHERE $__timeFilter(event_ts)\nGROUP BY 1, 2\nORDER BY 1",
+          "format": 0
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "displayName": "${__field.labels.metric}",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 70,
+            "stacking": {
+              "mode": "normal"
+            },
+            "lineWidth": 0
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Exchange \u2192 ingest latency",
+      "description": "",
+      "datasource": {
+        "type": "trino-datasource",
+        "uid": "trino"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "trino-datasource",
+            "uid": "trino"
+          },
+          "rawSQL": "SELECT $__timeGroup(event_ts, '1m') AS time,\n       approx_percentile(date_diff('millisecond', event_ts, ingest_ts), 0.5) AS p50,\n       approx_percentile(date_diff('millisecond', event_ts, ingest_ts), 0.99) AS p99\nFROM lake.silver.trades\nWHERE $__timeFilter(event_ts)\nGROUP BY 1\nORDER BY 1",
+          "format": 1
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "lineWidth": 2,
+            "insertNulls": 90000
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 7,
+      "type": "bargauge",
+      "title": "Stream vs batch reconciliation",
+      "description": "Every settled minute of gold.bars_1m checked against a batch recompute from silver. missing_in_stream: minutes the stream never emitted; count_mismatch: trades that arrived after the watermark.",
+      "datasource": {
+        "type": "trino-datasource",
+        "uid": "trino"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "trino-datasource",
+            "uid": "trino"
+          },
+          "rawSQL": "SELECT status, count(*) AS minutes\nFROM lake.marts.rpt_bar_reconciliation\nGROUP BY 1\nORDER BY 2 DESC",
+          "format": 1
+        }
+      ],
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "basic",
+        "showUnfilled": true,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": true
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 8,
+      "type": "table",
+      "title": "Trade-id gaps per day",
+      "description": "Holes in each symbol's contiguous trade-id span (dbt fct_bars_1d). Ingest downtime shows up here until the REST backfill fills it.",
+      "datasource": {
+        "type": "trino-datasource",
+        "uid": "trino"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 12,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "trino-datasource",
+            "uid": "trino"
+          },
+          "rawSQL": "SELECT CAST(trade_date AS varchar) AS trade_date, symbol, trade_count, missing_trade_ids\nFROM lake.marts.fct_bars_1d\nORDER BY trade_date DESC, symbol",
+          "format": 1
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto"
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 9,
+      "type": "table",
+      "title": "Table storage",
+      "description": "Live Iceberg data files per table. Streaming commits add small files; the hourly compaction job (Dagster) merges them.",
+      "datasource": {
+        "type": "trino-datasource",
+        "uid": "trino"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 12,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "trino-datasource",
+            "uid": "trino"
+          },
+          "rawSQL": "SELECT 'silver.trades' AS \"table\", count(*) AS files,\n       round(sum(file_size_in_bytes) / 1e6, 2) AS mb,\n       round(avg(file_size_in_bytes) / 1e3, 1) AS avg_kb\nFROM lake.silver.\"trades$files\"\nUNION ALL\nSELECT 'gold.bars_1m', count(*), round(sum(file_size_in_bytes) / 1e6, 2),\n       round(avg(file_size_in_bytes) / 1e3, 1)\nFROM lake.gold.\"bars_1m$files\"\nUNION ALL\nSELECT 'quarantine.trades', count(*), round(sum(file_size_in_bytes) / 1e6, 2),\n       round(avg(file_size_in_bytes) / 1e3, 1)\nFROM lake.quarantine.\"trades$files\"",
+          "format": 1
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto"
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 10,
+      "type": "table",
+      "title": "Latest quarantined records",
+      "description": "",
+      "datasource": {
+        "type": "trino-datasource",
+        "uid": "trino"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 20,
+        "w": 24,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "trino-datasource",
+            "uid": "trino"
+          },
+          "rawSQL": "SELECT quarantined_at, kafka_partition, kafka_offset, reject_reason,\n       from_utf8(raw_value) AS raw_value\nFROM lake.quarantine.trades\nORDER BY quarantined_at DESC\nLIMIT 20",
+          "format": 1
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto"
+          }
+        },
+        "overrides": []
+      }
+    }
+  ]
+}
