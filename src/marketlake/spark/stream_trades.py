@@ -16,6 +16,9 @@ gold    1-minute OHLCV + VWAP bars per (exchange, symbol), event-time windows wi
         the streaming bars (and counted). Phase 4 reconciles these against a
         batch recompute from silver. The Iceberg streaming sink records the epoch
         id in each snapshot and skips epochs it already committed.
+        One query per exchange: Spark keeps a single watermark per query, so a
+        shared query would let the fastest feed push it forward and drop a
+        lagging exchange's trades as late (#9).
 
 Run: uv run python -m marketlake.spark.stream_trades
 """
@@ -26,10 +29,11 @@ import argparse
 import logging
 import os
 import signal
+import time
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.streaming import StreamingQueryListener
+from pyspark.sql.streaming import StreamingQuery, StreamingQueryListener
 from pyspark.sql.types import LongType, StringType, StructField, StructType
 
 from marketlake.spark.session import build
@@ -213,6 +217,32 @@ def bars_1m(trades: DataFrame, watermark: str) -> DataFrame:
     )
 
 
+def gold_bars_by_exchange(trades: DataFrame, exchanges: list[str],
+                          watermark: str) -> dict[str, DataFrame]:
+    """One bars stream per exchange. Filtering before `bars_1m` puts the
+    watermark after the filter, so each exchange's watermark follows only its
+    own event times."""
+    return {ex: bars_1m(trades.where(F.col("exchange") == ex), watermark) for ex in exchanges}
+
+
+def gold_checkpoint(checkpoints: str, exchange: str) -> str:
+    return os.path.join(checkpoints, f"gold_bars_1m_{exchange}")
+
+
+def migrate_gold_checkpoint(checkpoints: str) -> None:
+    """Before #9 one gold query (checkpoint `gold_bars_1m`) covered coinbase,
+    the only exchange. Starting the coinbase query on a fresh checkpoint would
+    get a new query id, reread Kafka from the earliest offset, and append every
+    existing bar again: the Iceberg sink's replay check is per query id. The
+    id lives in the checkpoint's metadata, so renaming the directory keeps it,
+    and the added exchange filter is a compatible plan change."""
+    legacy = os.path.join(checkpoints, "gold_bars_1m")
+    target = gold_checkpoint(checkpoints, "coinbase")
+    if os.path.isdir(legacy) and not os.path.exists(target):
+        os.rename(legacy, target)
+        log.info("moved gold checkpoint %s -> %s", legacy, target)
+
+
 class ProgressLogger(StreamingQueryListener):
     """Logs per-batch throughput and rows dropped as too late by the watermark."""
 
@@ -237,6 +267,19 @@ class ProgressLogger(StreamingQueryListener):
         log.info("query %s terminated%s", event.id, f": {event.exception}" if event.exception else "")
 
 
+def stop_gracefully(query: StreamingQuery, timeout_s: float = 120.0) -> None:
+    """Stops the query between micro-batches. `stop()` interrupts the stream
+    thread, and mid-batch that cancels running jobs (inside foreachBatch, or
+    while the Kafka consumer closes) and ends in a StackOverflowError (#19).
+    The next trigger is seconds away, so stopping right after the in-flight
+    batch finishes doesn't race with a new one. Falls back to a plain stop
+    after `timeout_s`."""
+    deadline = time.monotonic() + timeout_s
+    while query.isActive and query.status["isTriggerActive"] and time.monotonic() < deadline:
+        time.sleep(0.05)
+    query.stop()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bootstrap", default="localhost:19092")
@@ -244,6 +287,9 @@ def main() -> None:
     ap.add_argument("--trigger", default="10 seconds")
     ap.add_argument("--watermark", default="30 seconds")
     ap.add_argument("--max-offsets", type=int, default=50_000)
+    # Trades from an exchange not listed here reach silver but get no
+    # streaming bars (rpt_bar_reconciliation shows them as missing_in_stream).
+    ap.add_argument("--exchanges", nargs="+", default=["coinbase"])
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
@@ -264,13 +310,15 @@ def main() -> None:
         .trigger(processingTime=args.trigger)
         .start()
     )
-    gold = (
-        bars_1m(trades, args.watermark).writeStream.queryName("gold_bars_1m")
+    migrate_gold_checkpoint(args.checkpoints)
+    golds = [
+        bars.writeStream.queryName(f"gold_bars_1m_{ex}")
         .format("iceberg").outputMode("append")
-        .option("checkpointLocation", os.path.join(args.checkpoints, "gold_bars_1m"))
+        .option("checkpointLocation", gold_checkpoint(args.checkpoints, ex))
         .trigger(processingTime=args.trigger)
         .toTable("gold.bars_1m")
-    )
+        for ex, bars in gold_bars_by_exchange(trades, args.exchanges, args.watermark).items()
+    ]
 
     # Don't call into the JVM from the signal handler: the main thread is
     # blocked inside a py4j call, and re-entering the gateway breaks it.
@@ -285,8 +333,8 @@ def main() -> None:
     while not stopping and not spark.streams.awaitAnyTermination(timeout=1):
         pass
     log.info("stopping queries")
-    for q in (silver, gold):
-        q.stop()
+    for q in (silver, *golds):
+        stop_gracefully(q)
     spark.stop()
 
 
