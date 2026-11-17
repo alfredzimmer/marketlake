@@ -37,6 +37,8 @@ uv run dagster dev                                # orchestration UI on :3000 (t
 uv run pytest
 ```
 
+Spark jobs can also run inside the compose network: `docker compose run --rm spark python -m marketlake.spark.<job>`. Use this for anything that scans thousands of files, since Docker Desktop's port proxy resets S3 connections under that load (finding 9).
+
 | service | port | |
 |---|---|---|
 | Redpanda (Kafka API) | 19092 | |
@@ -123,6 +125,8 @@ Problems that came up while running the pipeline live:
 6. **Rolling back a checkpoint's offsets silently drops gold bars.** The Iceberg streaming sink skips any epoch ≤ the last one it committed for that query id. After a forced replay re-planned later epochs under reused ids, bars were skipped without any error. The reconciliation report surfaced 8 missing minutes. A fresh checkpoint (new query id) is safe; editing one in place is not.
 7. **Spark's progress bar ate a dbt event.** dagster-dbt parses dbt's stdout as a stream of JSON events, and Spark's console progress bar writes to the same stdout. A `[Stage 36: …]\r` line glued to `fct_bars_1d`'s success event made it unparseable, so Dagster silently recorded no materialization for that model (the run still succeeded). It's intermittent, since it only hits events emitted while a stage is running. Fixed with `spark.ui.showConsoleProgress=false` in `spark_conf()`.
 8. **`query.stop()` mid-batch ends in a `StackOverflowError`.** `stop()` interrupts the stream thread. When a micro-batch is running (the silver `foreachBatch`, or the Kafka consumer closing), the interrupted job fails with a deep regex-matching stack overflow. Live with a 2s trigger, 3 of 6 stops hit it. No data was affected, since the batch replays idempotently, but the noise could hide a real error. The stream now waits for the in-flight batch to finish before stopping: 0 errors in 8 stops ([#19](../../issues/19)).
+
+9. **Docker Desktop's port proxy, not the object store, broke large scans.** From the host, repeated scans of a 6,000-file table failed on the 5th run with S3 `Connection reset` after 6 SDK retries. SeaweedFS logged nothing. The same scans from a container on the compose network passed 10/10 and ran 2x faster (2.2s vs 4.6s), while a host run straight afterwards failed again. At 17,280 files: 5/5 in-network, 1/3 from the host. The `spark` compose service (`profiles: [spark]`) runs jobs in-network with the same `uv.lock` dependencies; `marketlake.spark.bench_files` reproduces the comparison ([#18](../../issues/18)).
 
 ## Fault-injection testing (2026-11-15)
 

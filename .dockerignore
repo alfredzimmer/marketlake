@@ -1,0 +1,6 @@
+.venv/
+.git/
+data/
+dbt/target/
+dbt/logs/
+.pytest_cache/
