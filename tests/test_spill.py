@@ -68,7 +68,8 @@ def delivered_ids(producer):
 
 
 def make(tmp_path, producer):
-    return CoinbaseIngestor(["BTC-USD"], producer, spill_path=tmp_path / "spill.jsonl")
+    return CoinbaseIngestor(["BTC-USD"], producer, spill_path=tmp_path / "spill.jsonl",
+                            state_path=tmp_path / "trade_ids.json")
 
 
 def test_outage_spills_then_replays_everything(tmp_path):
