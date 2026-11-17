@@ -15,9 +15,11 @@ class GapDetector:
     forwarded downstream, where the silver layer dedupes on (exchange, symbol, trade_id).
     """
 
-    def __init__(self, exchange: str) -> None:
+    def __init__(self, exchange: str, last: dict[str, int] | None = None) -> None:
         self.exchange = exchange
-        self._last: dict[str, int] = {}
+        # Seeded from the previous run's state, the first trade after a restart
+        # reports the downtime as a gap instead of starting a fresh baseline (#8).
+        self._last: dict[str, int] = dict(last or {})
 
     def observe(self, symbol: str, trade_id: int) -> tuple[bool, Gap | None]:
         """Returns (is_new, gap). is_new is False for duplicates / stale ids."""
