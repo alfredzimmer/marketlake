@@ -286,8 +286,8 @@ class CoinbaseIngestor:
             self.stats.report()
 
 
-def make_producer(bootstrap: str) -> Producer:
-    return Producer({
+def producer_conf(bootstrap: str) -> dict:
+    return {
         "bootstrap.servers": bootstrap,
         # Idempotent producer: broker dedupes our retries, so a transient
         # network error can't write the same message twice into the log.
@@ -295,7 +295,15 @@ def make_producer(bootstrap: str) -> Producer:
         "acks": "all",
         "linger.ms": 20,
         "compression.type": "zstd",
-    })
+        # librdkafka defaults to CRC32; Java clients, Connect, Flink and rpk
+        # use murmur2. Match them, or the same key lands on a different
+        # partition depending on who produced it and per-key order breaks (#5).
+        "partitioner": "murmur2_random",
+    }
+
+
+def make_producer(bootstrap: str) -> Producer:
+    return Producer(producer_conf(bootstrap))
 
 
 def main() -> None:
