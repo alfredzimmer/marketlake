@@ -29,10 +29,11 @@ import argparse
 import logging
 import os
 import signal
+import time
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.streaming import StreamingQueryListener
+from pyspark.sql.streaming import StreamingQuery, StreamingQueryListener
 from pyspark.sql.types import LongType, StringType, StructField, StructType
 
 from marketlake.spark.session import build
@@ -266,6 +267,19 @@ class ProgressLogger(StreamingQueryListener):
         log.info("query %s terminated%s", event.id, f": {event.exception}" if event.exception else "")
 
 
+def stop_gracefully(query: StreamingQuery, timeout_s: float = 120.0) -> None:
+    """Stops the query between micro-batches. `stop()` interrupts the stream
+    thread, and mid-batch that cancels running jobs (inside foreachBatch, or
+    while the Kafka consumer closes) and ends in a StackOverflowError (#19).
+    The next trigger is seconds away, so stopping right after the in-flight
+    batch finishes doesn't race with a new one. Falls back to a plain stop
+    after `timeout_s`."""
+    deadline = time.monotonic() + timeout_s
+    while query.isActive and query.status["isTriggerActive"] and time.monotonic() < deadline:
+        time.sleep(0.05)
+    query.stop()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bootstrap", default="localhost:19092")
@@ -320,7 +334,7 @@ def main() -> None:
         pass
     log.info("stopping queries")
     for q in (silver, *golds):
-        q.stop()
+        stop_gracefully(q)
     spark.stop()
 
 
