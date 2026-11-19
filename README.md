@@ -18,8 +18,8 @@ Coinbase / Hyperliquid / Binance websockets
         data quality tests (OHLC, outliers, gaps, reconciliation)
    → Dagster orchestration                                  [phase 3 ✅]
    → Trino + Grafana dashboards                             [demo ✅]
-   → exactly-once proof, REST backfill, compaction,
-     batch-vs-stream reconciliation                         [phase 4]
+   → REST backfill of gaps, compaction, reconciliation      [phase 4 ✅]
+   → exactly-once proof                                     [phase 4]
 ```
 
 ## Quickstart
@@ -30,6 +30,7 @@ Requires Docker, [uv](https://docs.astral.sh/uv/), and Java 17+ (for Spark).
 docker compose up -d                              # Redpanda, SeaweedFS, Postgres, Iceberg REST
 uv sync
 uv run python -m marketlake.ingest.coinbase       # websocket → trades.raw
+uv run python -m marketlake.ingest.backfill       # ingest.gaps → REST → trades.raw
 uv run python -m marketlake.sink.bronze           # trades.raw → data/bronze/ (Parquet)
 uv run python -m marketlake.spark.stream_trades   # trades.raw → silver.trades, gold.bars_1m
 uv run python -m marketlake.ref.coinbase_products # product metadata → ref.coinbase_products
@@ -58,6 +59,7 @@ Spark jobs can also run inside the compose network: `docker compose run --rm spa
 - **Prices as decimal strings.** No float round-trips at ingest; typing happens in silver.
 - **Taker side, not maker side.** Coinbase reports the maker side. We store the aggressor side, the convention for order-flow metrics.
 - **Gap detection on `trade_id`.** Coinbase trade ids are contiguous per product. The detector's state survives reconnects, so a disconnect window shows up as a gap event on `ingest.gaps`, which the phase 4 backfiller consumes. It also survives restarts: the ingestor saves the highest *durable* trade id per symbol (acked by Kafka or in the spill journal) to `data/state/` every 5s and on shutdown, and seeds the detector from it. Saving durable ids rather than seen ids matters: trades still queued in the producer when the process is killed fall inside the next run's gap and get backfilled ([#8](../../issues/8)).
+- **Gaps are backfilled from REST.** The backfiller pages Coinbase's `/trades` endpoint over each gap, produces the trades to `trades.raw`, and commits the gap only after Kafka acks them (a replay is deduped in silver). Each gap gets an audit record on `ingest.backfills` (`complete` / `partial` / `skipped` / `failed`).
 - **Bronze never rejects a record.** Anything that fails parsing or validation (including partition-path values like `exchange="../.."`) is written to `exchange=_unparsed/` with its raw value and parse error. A poison pill can't stall the sink, and nothing is lost.
 - **Bronze sink is at-least-once by design.** Files are fsynced and atomically renamed *before* offsets are committed. File names encode the Kafka partition and offset range (`p1-733-1255.parquet`), so a replay is auditable. Deduplication on `(exchange, symbol, trade_id)` happens in silver.
 
