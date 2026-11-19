@@ -24,7 +24,8 @@ from datetime import UTC, datetime
 import httpx
 from confluent_kafka import Consumer, KafkaException, Producer
 
-from marketlake.ingest.coinbase import GAPS_TOPIC, TRADES_TOPIC, make_producer, parse_match
+from marketlake.ingest.coinbase import (EXCHANGE, GAPS_TOPIC, TRADES_TOPIC, make_producer,
+                                       parse_match)
 from marketlake.models import Gap, Trade
 
 TRADES_URL = "https://api.exchange.coinbase.com/products/{symbol}/trades"
@@ -50,12 +51,16 @@ class BackfillResult:
     fetched: int
     # Ids in the range the exchange doesn't have either (e.g. busted trades).
     unavailable: int
-    status: str  # "complete" | "partial" | "skipped"
+    status: str  # "complete" | "partial" | "skipped" | "failed"
     detected_ts: str
     backfilled_ts: str
 
     def to_json(self) -> bytes:
         return json.dumps(asdict(self), separators=(",", ":")).encode()
+
+
+class PermanentError(Exception):
+    """The exchange rejected the request in a way retrying won't change."""
 
 
 class TradesClient:
@@ -95,11 +100,22 @@ class TradesClient:
                 self.sleep(delay)
                 backoff = min(backoff * 2, MAX_RETRY_AFTER_S)
                 continue
-            resp.raise_for_status()
-            page = resp.json()
-            if not isinstance(page, list):
-                raise ValueError(f"unexpected trades payload: {str(page)[:200]}")
-            return page
+            if resp.status_code >= 400:
+                # 404 for a delisted/unknown product, 400 for bad params: retrying
+                # (or crash-looping on the gap) can't fix it.
+                raise PermanentError(f"GET {symbol} after={after} -> {resp.status_code}: "
+                                     f"{resp.text[:200]}")
+            try:
+                page = resp.json()
+            except ValueError:
+                page = None
+            if isinstance(page, list):
+                return page
+            # A 200 with an HTML error page from the CDN; usually clears up.
+            log.warning("GET %s after=%d: unexpected payload %.200r; retrying",
+                        symbol, after, resp.text)
+            self.sleep(backoff)
+            backoff = min(backoff * 2, MAX_RETRY_AFTER_S)
         raise RuntimeError(f"GET {symbol} trades after={after}: gave up after {MAX_RETRIES} attempts")
 
     def pages(self, symbol: str, first: int, last: int) -> Iterator[list[dict]]:
@@ -148,19 +164,24 @@ class Backfiller:
             fetched, status = 0, "skipped"
         else:
             fetched = 0
-            for page in self.client.pages(gap.symbol, gap.first_missing, gap.last_missing):
-                ingest_ts = datetime.now(UTC).isoformat()
-                for raw in page:
-                    t = to_trade(raw, gap.symbol, ingest_ts)
-                    self._produce(TRADES_TOPIC, t.key, t.to_json(), on_delivery)
-                fetched += len(page)
-                self.producer.poll(0)
-            status = "complete" if fetched == gap.size else "partial"
+            try:
+                for page in self.client.pages(gap.symbol, gap.first_missing, gap.last_missing):
+                    ingest_ts = datetime.now(UTC).isoformat()
+                    for raw in page:
+                        t = to_trade(raw, gap.symbol, ingest_ts)
+                        self._produce(TRADES_TOPIC, t.key, t.to_json(), on_delivery)
+                    fetched += len(page)
+                    self.producer.poll(0)
+                status = "complete" if fetched == gap.size else "partial"
+            except PermanentError as e:
+                log.error("gap %s %d..%d failed: %s", gap.symbol, gap.first_missing,
+                          gap.last_missing, e)
+                status = "failed"
 
         result = BackfillResult(
             exchange=gap.exchange, symbol=gap.symbol, first_missing=gap.first_missing,
             last_missing=gap.last_missing, fetched=fetched,
-            unavailable=0 if status == "skipped" else gap.size - fetched,
+            unavailable=gap.size - fetched if status in ("complete", "partial") else 0,
             status=status, detected_ts=gap.detected_ts,
             backfilled_ts=datetime.now(UTC).isoformat(),
         )
@@ -195,14 +216,19 @@ class Backfiller:
                 log.error("skipping malformed gap event at %s[%d]@%d (%s): %.200s",
                           msg.topic(), msg.partition(), msg.offset(), e, msg.value())
             else:
-                started = time.monotonic()
-                r = self.backfill(gap)
-                log.info("backfilled %s %d..%d: %d/%d ids (%s) in %.1fs", r.symbol,
-                         r.first_missing, r.last_missing, r.fetched, gap.size, r.status,
-                         time.monotonic() - started)
+                # ingest.gaps is shared by every exchange's ingestor.
+                if gap.exchange == EXCHANGE:
+                    self._handle(gap)
             # Only after the trades are acknowledged: a crash before this line
             # replays the gap, and silver's MERGE drops the duplicates.
             consumer.commit(message=msg, asynchronous=False)
+
+    def _handle(self, gap: Gap) -> None:
+        started = time.monotonic()
+        r = self.backfill(gap)
+        log.info("backfilled %s %d..%d: %d/%d ids (%s) in %.1fs", r.symbol,
+                 r.first_missing, r.last_missing, r.fetched, gap.size, r.status,
+                 time.monotonic() - started)
 
 
 def consumer_conf(bootstrap: str, group: str = "backfill-coinbase") -> dict:

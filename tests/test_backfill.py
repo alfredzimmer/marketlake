@@ -156,3 +156,46 @@ def test_run_commits_each_gap_and_skips_malformed_events():
     assert consumer.committed == [0, 1, 2]
     assert [(t["symbol"], t["trade_id"]) for t in producer.trades()] == [
         ("BTC-USD", 3), ("BTC-USD", 2), ("BTC-USD", 1), ("ETH-USD", 8), ("ETH-USD", 7)]
+
+
+def scripted_client(responses):
+    """Serves the given responses in order, then repeats the last one."""
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return responses[min(len(calls), len(responses)) - 1]
+
+    return TradesClient(httpx.Client(transport=httpx.MockTransport(handler)),
+                        min_interval_s=0, sleep=lambda s: None), calls
+
+
+def test_permanent_errors_are_recorded_not_crash_looped():
+    client, calls = scripted_client([httpx.Response(404, json={"message": "NotFound"})])
+    producer = FakeProducer()
+    consumer = FakeConsumer([gap(1, 5, "GONE-USD").to_json(), gap(1, 3).to_json()])
+    Backfiller(producer, client).run(consumer, stop=lambda: not consumer.queue)
+    # The 404 is not retried, and doesn't block the gap behind it.
+    assert consumer.committed == [0, 1]
+    assert [r["status"] for r in producer.results()] == ["failed", "failed"]
+    assert len(calls) == 2
+
+
+def test_non_json_200_is_retried():
+    client, calls = scripted_client([
+        httpx.Response(200, text="<html>cloudflare</html>"),
+        httpx.Response(200, json=[rest_trade(2), rest_trade(1)]),
+    ])
+    producer = FakeProducer()
+    assert Backfiller(producer, client).backfill(gap(1, 2)).status == "complete"
+    assert len(calls) == 2
+
+
+def test_gaps_from_other_exchanges_are_left_alone():
+    client, calls = fake_exchange()
+    producer = FakeProducer()
+    other = Gap(exchange="binance", symbol="BTCUSDT", first_missing=1, last_missing=5,
+                detected_ts="2026-11-17T16:06:00+00:00")
+    consumer = FakeConsumer([other.to_json()])
+    Backfiller(producer, client).run(consumer, stop=lambda: not consumer.queue)
+    assert consumer.committed == [0] and calls == [] and producer.messages == []
