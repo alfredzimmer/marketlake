@@ -17,6 +17,7 @@ Coinbase / Hyperliquid / Binance websockets
         fct_bars_1d, dim_symbol (SCD2), rpt_bar_reconciliation
         data quality tests (OHLC, outliers, gaps, reconciliation)
    → Dagster orchestration                                  [phase 3 ✅]
+   → Trino + Grafana dashboards                             [demo ✅]
    → exactly-once proof, REST backfill, compaction,
      batch-vs-stream reconciliation                         [phase 4]
 ```
@@ -34,6 +35,7 @@ uv run python -m marketlake.spark.stream_trades   # trades.raw → silver.trades
 uv run python -m marketlake.ref.coinbase_products # product metadata → ref.coinbase_products
 uv run python -m marketlake.transform build       # dbt: snapshot, models, tests
 uv run dagster dev                                # orchestration UI on :3000 (turn schedules on there)
+open http://localhost:3001                        # Grafana dashboards (starts with `docker compose up`)
 uv run pytest
 ```
 
@@ -45,6 +47,8 @@ Spark jobs can also run inside the compose network: `docker compose run --rm spa
 | Redpanda Console | 8080 | browse topics |
 | Iceberg REST catalog | 8181 | |
 | SeaweedFS S3 | 8333 | bucket `warehouse` |
+| Trino | 8090 | catalog `lake` (`docker compose exec trino trino --catalog lake`) |
+| Grafana | 3001 | dashboards; anonymous view, admin / `marketlake` |
 
 ## Design decisions
 
@@ -113,6 +117,17 @@ Data quality tests:
 
 `dagster dev` parses the dbt project on startup. Outside it (e.g. `dagster job execute`, a deployment), run `uv run python -m marketlake.transform parse` first so `dbt/target/manifest.json` exists.
 
+### Dashboards (Trino + Grafana)
+
+Trino reads the same Iceberg REST catalog and S3 warehouse as Spark and dbt (`infra/trino/catalog/lake.properties`), so every layer is queryable over SQL with no export step. Grafana queries Trino through the official [`trino-datasource`](https://github.com/trinodb/grafana-trino) plugin, installed before the server starts. The data source and dashboards are provisioned from `infra/grafana/`, so `docker compose up` brings them up configured. Both dashboards refresh every 10s.
+
+| dashboard | panels |
+|---|---|
+| **Market** (home) | last price, VWAP, trade count, taker buy share; 1-minute candlesticks with volume from `gold.bars_1m`; trades/s by taker side; close vs VWAP. `$symbol` picker. |
+| **Pipeline health** | seconds since last trade, exchange→ingest latency (p50/p99), quarantined records with raw payloads, stream-vs-batch mismatches and per-status counts (`rpt_bar_reconciliation`), trade-id gaps per day (`fct_bars_1d`), Iceberg data files per table (`$files`). |
+
+An ingest outage is visible on both: on 2026-11-17 the Coinbase websocket hit a keepalive timeout at 16:05 UTC and took 48s to reconnect. The candlestick chart is missing that minute, the per-minute charts break, and the gap detector reported the 7,334 missing trade ids on `ingest.gaps`.
+
 ## Findings
 
 Problems that came up while running the pipeline live:
@@ -125,7 +140,6 @@ Problems that came up while running the pipeline live:
 6. **Rolling back a checkpoint's offsets silently drops gold bars.** The Iceberg streaming sink skips any epoch ≤ the last one it committed for that query id. After a forced replay re-planned later epochs under reused ids, bars were skipped without any error. The reconciliation report surfaced 8 missing minutes. A fresh checkpoint (new query id) is safe; editing one in place is not.
 7. **Spark's progress bar ate a dbt event.** dagster-dbt parses dbt's stdout as a stream of JSON events, and Spark's console progress bar writes to the same stdout. A `[Stage 36: …]\r` line glued to `fct_bars_1d`'s success event made it unparseable, so Dagster silently recorded no materialization for that model (the run still succeeded). It's intermittent, since it only hits events emitted while a stage is running. Fixed with `spark.ui.showConsoleProgress=false` in `spark_conf()`.
 8. **`query.stop()` mid-batch ends in a `StackOverflowError`.** `stop()` interrupts the stream thread. When a micro-batch is running (the silver `foreachBatch`, or the Kafka consumer closing), the interrupted job fails with a deep regex-matching stack overflow. Live with a 2s trigger, 3 of 6 stops hit it. No data was affected, since the batch replays idempotently, but the noise could hide a real error. The stream now waits for the in-flight batch to finish before stopping: 0 errors in 8 stops ([#19](../../issues/19)).
-
 9. **Docker Desktop's port proxy, not the object store, broke large scans.** From the host, repeated scans of a 6,000-file table failed on the 5th run with S3 `Connection reset` after 6 SDK retries. SeaweedFS logged nothing. The same scans from a container on the compose network passed 10/10 and ran 2x faster (2.2s vs 4.6s), while a host run straight afterwards failed again. At 17,280 files: 5/5 in-network, 1/3 from the host. The `spark` compose service (`profiles: [spark]`) runs jobs in-network with the same `uv.lock` dependencies; `marketlake.spark.bench_files` reproduces the comparison ([#18](../../issues/18)).
 
 ## Fault-injection testing (2026-11-15)

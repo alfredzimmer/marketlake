@@ -86,6 +86,41 @@ services:
       init-bucket:
         condition: service_completed_successfully
 
+  # SQL over the lake: reads the same Iceberg catalog as Spark and dbt.
+  trino:
+    image: trinodb/trino:484
+    ports:
+      - "8090:8080"
+    volumes:
+      - ./infra/trino/catalog/lake.properties:/etc/trino/catalog/lake.properties:ro
+    mem_limit: 2g
+    depends_on:
+      iceberg-rest:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "trino --execute 'SELECT 1' || exit 1"]
+      interval: 5s
+      retries: 30
+
+  # Demo dashboards over Trino, provisioned from infra/grafana.
+  grafana:
+    image: grafana/grafana:13.1.10
+    ports:
+      - "3001:3000"
+    environment:
+      # Install before the server starts, so dashboards never load without it.
+      GF_PLUGINS_PREINSTALL_SYNC: trino-datasource@1.4.1
+      GF_SECURITY_ADMIN_PASSWORD: marketlake
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/market.json
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      trino:
+        condition: service_healthy
+
   # Run Spark jobs inside the network instead of through the host port proxy
   # (#18). Not started by `up`; use e.g.
   #   docker compose run --rm spark python -m marketlake.spark.bench_files scan
